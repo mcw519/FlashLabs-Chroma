@@ -214,6 +214,44 @@ To disable text generation (audio only):
 python scripts/run_realtime_webrtc.py --disable-text
 ```
 
+### Streaming Voicebot WebSocket Server
+
+The new voicebot engine provides a reusable streaming backend with:
+- Session lifecycle (`session.start`, `session.update`, `session.end`)
+- Audio streaming input (`audio.append`, base64 PCM16 @ 16kHz)
+- Incremental response output (`response.audio.delta`, base64 PCM16 @ 24kHz)
+- Turn control (`audio.commit`, `response.cancel`)
+
+Run the server:
+
+```bash
+python scripts/run_voicebot_ws.py \
+  --use-half-precision \
+  --prompt-speaker scarlett_johansson \
+  --host 0.0.0.0 \
+  --port 8765
+```
+
+Minimal client event flow:
+```json
+{"type":"session.start","session_id":"demo-1"}
+{"type":"audio.append","session_id":"demo-1","audio_b64":"..."}
+{"type":"audio.commit","session_id":"demo-1","transcript":"optional user text"}
+```
+
+Microphone streaming client (local mic -> WebSocket):
+```bash
+python -m pip install sounddevice websockets
+python scripts/run_voicebot_ws_mic_client.py \
+  --url ws://127.0.0.1:8765 \
+  --speaker scarlett_johansson
+```
+
+The mic client auto-detects speech and sends `audio.commit` on pause, and will send
+`response.cancel` automatically when barge-in is detected during model playback.
+
+Detailed guide: `docs/VOICEBOT_WS_MIC_CLIENT.md`
+
 ## Troubleshooting
 
 ### Common Issues

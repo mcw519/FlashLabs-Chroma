@@ -538,6 +538,7 @@ dependencies = [
     { name = "torchaudio" },
     { name = "torchvision" },
     { name = "transformers" },
+    { name = "websockets" },
 ]
 
 [package.metadata]
@@ -559,6 +560,7 @@ requires-dist = [
     { name = "torchaudio", specifier = "==2.7.1" },
     { name = "torchvision", specifier = "==0.22.1" },
     { name = "transformers", specifier = "==5.0.0rc0" },
+    { name = "websockets", specifier = ">=12.0" },
 ]
 
 [[package]]
