@@ -100,6 +100,11 @@ def parse_args() -> argparse.Namespace:
         default="sentence",
         choices=["none", "sentence", "final"],
     )
+    parser.add_argument(
+        "--include-transcript-in-query",
+        action="store_true",
+        help="Include transcript text in the same-turn user query (text + audio)",
+    )
 
     parser.add_argument("--chunk-ms", type=int, default=40)
     parser.add_argument("--pre-roll-ms", type=int, default=200)
@@ -361,6 +366,7 @@ async def run_client(args: argparse.Namespace) -> None:
                     "memory_turns": args.memory_turns,
                     "output_chunk_sec": args.output_chunk_sec,
                     "text_mode": args.text_mode,
+                    "include_transcript_in_query": args.include_transcript_in_query,
                 },
             },
             send_lock,

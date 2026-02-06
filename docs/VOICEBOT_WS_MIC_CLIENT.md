@@ -73,6 +73,7 @@ Session/output:
 - `--memory-turns`: context turns (default `6`)
 - `--output-chunk-sec`: response chunk cadence
 - `--text-mode`: `none|sentence|final`
+- `--include-transcript-in-query`: include transcript in same-turn query (`text + audio`, default off)
 
 VAD/turn segmentation:
 
@@ -115,7 +116,7 @@ Barge-in flow:
 Client -> Server:
 
 ```json
-{"type":"session.start","session_id":"mic-demo","config":{"speaker":"scarlett_johansson","memory_turns":6,"output_chunk_sec":0.24,"text_mode":"sentence"}}
+{"type":"session.start","session_id":"mic-demo","config":{"speaker":"scarlett_johansson","memory_turns":6,"output_chunk_sec":0.24,"text_mode":"sentence","include_transcript_in_query":false}}
 ```
 
 ```json
