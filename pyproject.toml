@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "flashlabs-chroma"
 version = "1.0.0"
@@ -27,3 +31,10 @@ dependencies = [
 
 [tool.uv]
 extra-index-url = ["https://download.pytorch.org/whl/cu126"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["chroma*"]
