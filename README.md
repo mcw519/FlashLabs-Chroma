@@ -71,12 +71,15 @@ Chroma 1.0 is capable of:
 git clone https://github.com/FlashLabs-AI-Corp/FlashLabs-Chroma.git
 cd FlashLabs-Chroma
 
-# Optional: Create a new conda environment with Python 3.11
-conda create -n chroma python=3.11 -y
-conda activate chroma
+# Install uv (once)
+pip install uv
+
+# Optional: Create a new virtual environment with Python 3.11
+uv venv -p 3.11
+source .venv/bin/activate
 
 # Install dependencies in the correct order
-pip install -r requirements.txt
+uv sync
 
 ```
 
@@ -185,9 +188,9 @@ Audio(audio_values[0].cpu().detach().numpy(), rate=24_000)
 1. Ensure you install packages in the correct order (PyTorch/torchvision before transformers)
 2. If you already installed them, reinstall in the correct order:
    ```bash
-   pip uninstall transformers torchvision torch -y
-   pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu126
-   pip install transformers==5.0.0rc0
+   uv pip uninstall transformers torchvision torch -y
+   uv pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu126
+   uv pip install transformers==5.0.0rc0
    ```
 3. Restart your Python kernel/session after reinstalling
 

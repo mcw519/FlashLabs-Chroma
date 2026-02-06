@@ -1,0 +1,25 @@
+[project]
+name = "flashlabs-chroma"
+version = "1.0.0"
+description = "FlashLabs Chroma 1.0 spoken dialogue model"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch==2.7.1",
+    "torchvision==0.22.1",
+    "torchaudio==2.7.1",
+    "transformers==5.0.0rc0",
+    "colorlog>=6.8.2",
+    "av>=14.0.0",
+    "librosa>=0.11.0",
+    "audioread>=3.0.0",
+    "soundfile>=0.13.0",
+    "pillow>=11.0.0",
+    "accelerate>=1.7.0",
+    "numpy>=2.2.0",
+    "safetensors>=0.5.0",
+    "huggingface-hub>=1.3.0",
+]
+
+[tool.uv]
+extra-index-url = ["https://download.pytorch.org/whl/cu126"]
