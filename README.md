@@ -232,12 +232,25 @@ python scripts/run_voicebot_ws.py \
   --port 8765
 ```
 
+Enable server-side ASR (client does not need to send transcript):
+```bash
+python scripts/run_voicebot_ws.py \
+  --use-half-precision \
+  --server-asr-model openai/whisper-small \
+  --server-asr-language zh \
+  --server-asr-device auto
+```
+
 Minimal client event flow:
 ```json
-{"type":"session.start","session_id":"demo-1"}
+{"type":"session.start","session_id":"demo-1","config":{"include_transcript_in_query":false}}
 {"type":"audio.append","session_id":"demo-1","audio_b64":"..."}
 {"type":"audio.commit","session_id":"demo-1","transcript":"optional user text"}
 ```
+
+`include_transcript_in_query` defaults to `false` (current behavior): transcript is stored in memory only.
+Set it to `true` to include transcript in the same turn's user query (`text + audio`).
+When `--server-asr-model` is enabled on server, `audio.commit.transcript` from client is ignored.
 
 Microphone streaming client (local mic -> WebSocket):
 ```bash

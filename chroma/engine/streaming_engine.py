@@ -373,6 +373,7 @@ class StreamingVoicebotEngine:
             memory_turns = kwargs.get("memory_turns")
             output_chunk_sec = kwargs.get("output_chunk_sec")
             text_mode = kwargs.get("text_mode")
+            include_transcript_in_query = kwargs.get("include_transcript_in_query")
             merged = SessionConfig(
                 speaker=config.speaker if speaker is None else speaker,
                 memory_turns=config.memory_turns if memory_turns is None else memory_turns,
@@ -380,6 +381,11 @@ class StreamingVoicebotEngine:
                 if output_chunk_sec is None
                 else output_chunk_sec,
                 text_mode=config.text_mode if text_mode is None else text_mode,
+                include_transcript_in_query=(
+                    config.include_transcript_in_query
+                    if include_transcript_in_query is None
+                    else include_transcript_in_query
+                ),
             )
             state.config = self._normalize_config(merged)
             logger.debug("session config updated session_id=%s config=%s", session_id, state.config)
@@ -420,6 +426,11 @@ class StreamingVoicebotEngine:
                     prev_size,
                     len(state.audio_buffer),
                 )
+
+    def get_buffered_audio(self, session_id: str) -> bytes:
+        state = self._get_session(session_id)
+        with state.lock:
+            return bytes(state.audio_buffer)
 
     def cancel_response(self, session_id: str) -> None:
         logger.info("cancel_response requested session_id=%s", session_id)
@@ -546,6 +557,7 @@ class StreamingVoicebotEngine:
                 session_id=session_id,
                 turn_id=turn_id,
                 query_text=user_text,
+                include_transcript_in_query=config.include_transcript_in_query,
             )
             logger.debug(
                 "commit_turn inputs ready session_id=%s turn_id=%s keys=%s",
@@ -851,6 +863,7 @@ class StreamingVoicebotEngine:
         session_id: str,
         turn_id: str,
         query_text: str | None,
+        include_transcript_in_query: bool,
     ) -> dict[str, torch.Tensor]:
         logger.debug("prepare_inputs start speaker=%s audio_shape=%s", speaker, _shape(audio_np))
         prompt_text, prompt_audio = self._load_prompt(speaker)
@@ -860,17 +873,22 @@ class StreamingVoicebotEngine:
             turn_id=turn_id,
             memory_context=memory_context,
             query_text=query_text,
+            include_transcript_in_query=include_transcript_in_query,
         )
         system_text = SYSTEM_PROMPT
         if memory_context:
             system_text = f"{SYSTEM_PROMPT}\n\n{memory_context}"
+        user_content: list[dict[str, Any]] = []
+        if include_transcript_in_query and query_text:
+            user_content.append({"type": "text", "text": query_text})
+        user_content.append({"type": "audio", "audio": audio_np})
         conversation = [
             [
                 {
                     "role": "system",
                     "content": [{"type": "text", "text": system_text}],
                 },
-                {"role": "user", "content": [{"type": "audio", "audio": audio_np}]},
+                {"role": "user", "content": user_content},
             ]
         ]
         inputs = self.processor(
@@ -894,8 +912,14 @@ class StreamingVoicebotEngine:
         turn_id: str,
         memory_context: str,
         query_text: str | None,
+        include_transcript_in_query: bool,
     ) -> None:
-        query_preview = _clip_text(query_text, max_chars=220) if query_text else "(audio-only; no transcript)"
+        if include_transcript_in_query and query_text:
+            query_preview = _clip_text(query_text, max_chars=220)
+            query_mode = "audio+transcript"
+        else:
+            query_preview = "(audio-only; no transcript)"
+            query_mode = "audio-only"
         history_preview = (
             _clip_text(memory_context.replace("\n", " | "), max_chars=460)
             if memory_context
@@ -905,7 +929,7 @@ class StreamingVoicebotEngine:
             "input context session_id=%s turn_id=%s %s",
             session_id,
             turn_id,
-            _colorize(f"QUERY   {query_preview}", _ANSI_QUERY),
+            _colorize(f"QUERY   [{query_mode}] {query_preview}", _ANSI_QUERY),
         )
         logger.info(
             "input context session_id=%s turn_id=%s %s",
@@ -1003,14 +1027,34 @@ class StreamingVoicebotEngine:
         if text_mode not in {"none", "sentence", "final"}:
             text_mode = "sentence"
 
+        include_transcript_in_query = self._coerce_bool(
+            config.include_transcript_in_query,
+            default=False,
+        )
+
         normalized = SessionConfig(
             speaker=speaker,
             memory_turns=memory_turns,
             output_chunk_sec=output_chunk_sec,
             text_mode=text_mode,
+            include_transcript_in_query=include_transcript_in_query,
         )
         logger.debug("normalize_config output=%s", normalized)
         return normalized
+
+    @staticmethod
+    def _coerce_bool(value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "y", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "n", "off", ""}:
+                return False
+        return default
 
     def _get_session(self, session_id: str) -> _SessionState:
         with self._sessions_lock:

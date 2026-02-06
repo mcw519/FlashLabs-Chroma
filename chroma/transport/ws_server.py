@@ -5,7 +5,7 @@ import base64
 import json
 import logging
 import uuid
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Protocol
 
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -16,6 +16,10 @@ from chroma.engine.types import ErrorEvent, SessionConfig, event_to_dict
 logger = logging.getLogger(__name__)
 
 
+class AudioTranscriber(Protocol):
+    def transcribe_pcm16_16k(self, pcm16_16k: bytes) -> str | None: ...
+
+
 class VoicebotWebSocketServer:
     def __init__(
         self,
@@ -24,11 +28,15 @@ class VoicebotWebSocketServer:
         host: str,
         port: int,
         max_message_size: int = 8 * 1024 * 1024,
+        asr_transcriber: AudioTranscriber | None = None,
+        server_asr_timeout_sec: float = 1.2,
     ) -> None:
         self.engine = engine
         self.host = host
         self.port = port
         self.max_message_size = max_message_size
+        self.asr_transcriber = asr_transcriber
+        self.server_asr_timeout_sec = max(0.05, float(server_asr_timeout_sec))
 
     async def serve_forever(self) -> None:
         logger.info("Starting WebSocket server on ws://%s:%s", self.host, self.port)
@@ -166,6 +174,7 @@ class VoicebotWebSocketServer:
             memory_turns=config_payload.get("memory_turns", 6),
             output_chunk_sec=config_payload.get("output_chunk_sec", 0.24),
             text_mode=config_payload.get("text_mode", "sentence"),
+            include_transcript_in_query=config_payload.get("include_transcript_in_query", False),
         )
         self.engine.create_session(session_id, config)
         owned_sessions.add(session_id)
@@ -177,6 +186,7 @@ class VoicebotWebSocketServer:
                 "memory_turns": config.memory_turns,
                 "output_chunk_sec": config.output_chunk_sec,
                 "text_mode": config.text_mode,
+                "include_transcript_in_query": config.include_transcript_in_query,
             },
         }
 
@@ -189,6 +199,7 @@ class VoicebotWebSocketServer:
             memory_turns=updates.get("memory_turns"),
             output_chunk_sec=updates.get("output_chunk_sec"),
             text_mode=updates.get("text_mode"),
+            include_transcript_in_query=updates.get("include_transcript_in_query"),
         )
         return {
             "type": "session.updated",
@@ -225,8 +236,21 @@ class VoicebotWebSocketServer:
             transcript = request.get("transcript")
             if transcript is not None and not isinstance(transcript, str):
                 raise ValueError("Field 'transcript' must be string")
-            if transcript:
+            server_transcript = await self._transcribe_for_commit(session_id)
+            if server_transcript:
+                self.engine.set_pending_user_text(session_id, server_transcript)
+                logger.info(
+                    "server_asr transcript accepted session_id=%s length=%s",
+                    session_id,
+                    len(server_transcript),
+                )
+            elif self.asr_transcriber is None and transcript:
                 self.engine.set_pending_user_text(session_id, transcript)
+            elif self.asr_transcriber is not None and transcript:
+                logger.debug(
+                    "client transcript ignored because server ASR is enabled session_id=%s",
+                    session_id,
+                )
 
             async for event in self.engine.commit_turn(session_id):
                 if not await send_json(event_to_dict(event)):
@@ -248,6 +272,28 @@ class VoicebotWebSocketServer:
                     )
                 )
             )
+
+    async def _transcribe_for_commit(self, session_id: str) -> str | None:
+        if self.asr_transcriber is None:
+            return None
+        audio_bytes = self.engine.get_buffered_audio(session_id)
+        if not audio_bytes:
+            return None
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self.asr_transcriber.transcribe_pcm16_16k, audio_bytes),
+                timeout=self.server_asr_timeout_sec,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "server_asr timed out session_id=%s timeout_sec=%.2f",
+                session_id,
+                self.server_asr_timeout_sec,
+            )
+            return None
+        except Exception:
+            logger.exception("server_asr failed session_id=%s", session_id)
+            return None
 
     def _handle_response_cancel(self, request: dict[str, Any]) -> dict[str, Any]:
         session_id = self._require_session_id(request)

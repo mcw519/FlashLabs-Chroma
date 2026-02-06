@@ -9,6 +9,7 @@ import logging
 
 from chroma.engine import StreamingVoicebotEngine
 from chroma.transport import VoicebotWebSocketServer
+from chroma.transport.server_asr import build_server_asr_transcriber
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,6 +30,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--max-message-size", type=int, default=8 * 1024 * 1024)
     parser.add_argument("--warmup", action="store_true")
+    parser.add_argument(
+        "--server-asr-model",
+        type=str,
+        default="",
+        help="Optional server-side ASR model id/path (e.g. openai/whisper-small)",
+    )
+    parser.add_argument(
+        "--server-asr-language",
+        type=str,
+        default="",
+        help="Optional ASR language hint (e.g. zh, en)",
+    )
+    parser.add_argument(
+        "--server-asr-device",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda"],
+        help="Device for server-side ASR",
+    )
+    parser.add_argument(
+        "--server-asr-timeout-sec",
+        type=float,
+        default=1.2,
+        help="Timeout for server-side ASR per committed turn",
+    )
     return parser.parse_args()
 
 
@@ -50,11 +76,19 @@ def main() -> None:
         warmup=args.warmup,
     )
 
+    asr_transcriber = build_server_asr_transcriber(
+        model_id=args.server_asr_model,
+        language=args.server_asr_language,
+        device=args.server_asr_device,
+    )
+
     server = VoicebotWebSocketServer(
         engine=engine,
         host=args.host,
         port=args.port,
         max_message_size=args.max_message_size,
+        asr_transcriber=asr_transcriber,
+        server_asr_timeout_sec=args.server_asr_timeout_sec,
     )
     asyncio.run(server.serve_forever())
 

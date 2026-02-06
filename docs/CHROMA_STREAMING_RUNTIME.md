@@ -22,7 +22,7 @@
 - 用途：建立 session 與初始 config
 - 範例：
 ```json
-{"type":"session.start","session_id":"demo-1","config":{"speaker":"scarlett_johansson","memory_turns":6,"output_chunk_sec":0.5,"text_mode":"sentence"}}
+{"type":"session.start","session_id":"demo-1","config":{"speaker":"scarlett_johansson","memory_turns":6,"output_chunk_sec":0.5,"text_mode":"sentence","include_transcript_in_query":false}}
 ```
 
 2. `audio.append`
@@ -37,6 +37,10 @@
 - `transcript` 可選（若有，會先寫入 user memory）
 - `transcript` 來源是 client 端（或 client 前面的 ASR 服務）先轉寫後再帶入，server 端不會自行做 STT。
 - 若 client 不送 `transcript`，本回合仍可用 audio 正常推論，但記憶只會新增 assistant 文字（除非後續回合有帶 transcript）。
+- `include_transcript_in_query`（session config，預設 `false`）：
+  - `false`：維持目前行為，`transcript` 只進 memory，不進本回合 query。
+  - `true`：本回合 query 會用 `text + audio` 一起送入 thinker/backbone。
+- 若 server 啟用 `--server-asr-model`，`audio.commit.transcript` 會被忽略，改由 server 端用當前 turn 的 audio buffer 轉寫。
 ```json
 {"type":"audio.commit","session_id":"demo-1","transcript":"optional"}
 ```
@@ -45,6 +49,7 @@
 
 - Browser/WebRTC client：可用 Web Speech API、Whisper API、或自建 ASR，將文字放進 `audio.commit.transcript`。
 - Python mic client（`scripts/run_voicebot_ws_mic_client.py`）目前預設只送音訊與 `audio.commit`，不內建 STT；若要寫入 user memory，需在 client 端加一段即時轉寫再填入 `transcript`。
+- 若不希望 client 參與轉寫，可在 server 啟動時加上 `--server-asr-model`，由 server 在每次 `audio.commit` 前執行 ASR 並自動寫入。
 
 4. `response.cancel`
 - 用途：要求中斷目前回覆（barge-in）
@@ -53,7 +58,7 @@
 ```
 
 5. `session.update` / `session.end`
-- 更新 config 或結束 session。
+- 更新 config（可包含 `include_transcript_in_query`）或結束 session。
 
 ### 2.2 音訊格式與限制
 
@@ -100,6 +105,7 @@ flowchart TD
 - `_prepare_inputs()`：
   - 載入 prompt speaker 參考 audio/text
   - 拼接 system prompt + memory context
+  - 依 `include_transcript_in_query` 決定本回合 user content 是 `audio` 或 `text + audio`
   - 交給 processor 產生 thinker/backbone 所需 tensor
   - tensor 移動到 model device/dtype
 
@@ -183,6 +189,8 @@ Memory 只在兩個時機點被寫入：
 - 進入 `commit_turn()` 後，會先取出並清空 `pending_user_text`
   （line 466-467），若有內容則 `_append_memory(state, "user", user_text)`
   （line 484-485）。
+- 若 `include_transcript_in_query=true`，同一回合 `_prepare_inputs()` 也會把 transcript
+  併入 user content（`text + audio`）；`false` 則僅 audio。
 
 2. 生成完成後寫入 assistant 記憶
 - `commit_turn()` 的生成流程結束後會做 `_generate_text(...)`。

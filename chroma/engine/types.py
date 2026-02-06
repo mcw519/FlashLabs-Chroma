@@ -12,6 +12,7 @@ class SessionConfig:
     memory_turns: int = 6
     output_chunk_sec: float = 0.24
     text_mode: TextMode = "sentence"
+    include_transcript_in_query: bool = False
 
 
 @dataclass(slots=True)
