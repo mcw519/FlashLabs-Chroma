@@ -5,9 +5,10 @@ import base64
 import json
 import logging
 import uuid
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import websockets
+from websockets.exceptions import ConnectionClosed
 
 from chroma.engine.streaming_engine import StreamingVoicebotEngine
 from chroma.engine.types import ErrorEvent, SessionConfig, event_to_dict
@@ -44,9 +45,13 @@ class VoicebotWebSocketServer:
         stream_tasks: dict[str, asyncio.Task] = {}
         send_lock = asyncio.Lock()
 
-        async def send_json(payload: dict[str, Any]) -> None:
+        async def send_json(payload: dict[str, Any]) -> bool:
             async with send_lock:
-                await websocket.send(json.dumps(payload, ensure_ascii=True))
+                try:
+                    await websocket.send(json.dumps(payload, ensure_ascii=True))
+                except ConnectionClosed:
+                    return False
+            return True
 
         try:
             async for raw_message in websocket:
@@ -79,13 +84,16 @@ class VoicebotWebSocketServer:
                 try:
                     if event_type == "session.start":
                         response = self._handle_session_start(request, owned_sessions)
-                        await send_json(response)
+                        if not await send_json(response):
+                            break
                     elif event_type == "session.update":
                         response = self._handle_session_update(request)
-                        await send_json(response)
+                        if not await send_json(response):
+                            break
                     elif event_type == "audio.append":
                         response = self._handle_audio_append(request)
-                        await send_json(response)
+                        if not await send_json(response):
+                            break
                     elif event_type == "audio.commit":
                         session_id = self._require_session_id(request)
                         task = stream_tasks.get(session_id)
@@ -98,18 +106,21 @@ class VoicebotWebSocketServer:
                                 send_json=send_json,
                             )
                         )
-                        await send_json(
+                        if not await send_json(
                             {
                                 "type": "response.stream.started",
                                 "session_id": session_id,
                             }
-                        )
+                        ):
+                            break
                     elif event_type == "response.cancel":
                         response = self._handle_response_cancel(request)
-                        await send_json(response)
+                        if not await send_json(response):
+                            break
                     elif event_type == "session.end":
                         response = self._handle_session_end(request, owned_sessions)
-                        await send_json(response)
+                        if not await send_json(response):
+                            break
                     else:
                         await self._send_error(
                             websocket,
@@ -120,6 +131,9 @@ class VoicebotWebSocketServer:
                             ),
                             send_json=send_json,
                         )
+                except ConnectionClosed:
+                    logger.info("WebSocket closed by client while handling event: %s", event_type)
+                    break
                 except Exception as exc:
                     logger.exception("Failed to handle event: %s", event_type)
                     await self._send_error(
@@ -131,9 +145,13 @@ class VoicebotWebSocketServer:
                         ),
                         send_json=send_json,
                     )
+        except ConnectionClosed:
+            logger.info("WebSocket connection closed")
         finally:
             for task in stream_tasks.values():
                 task.cancel()
+            if stream_tasks:
+                await asyncio.gather(*stream_tasks.values(), return_exceptions=True)
             for session_id in owned_sessions:
                 try:
                     self.engine.close_session(session_id)
@@ -195,7 +213,12 @@ class VoicebotWebSocketServer:
             "num_bytes": len(audio_bytes),
         }
 
-    async def _handle_audio_commit(self, websocket, request: dict[str, Any], send_json) -> None:
+    async def _handle_audio_commit(
+        self,
+        websocket,
+        request: dict[str, Any],
+        send_json: Callable[[dict[str, Any]], Awaitable[bool]],
+    ) -> None:
         session_id = request.get("session_id")
         try:
             session_id = self._require_session_id(request)
@@ -206,11 +229,14 @@ class VoicebotWebSocketServer:
                 self.engine.set_pending_user_text(session_id, transcript)
 
             async for event in self.engine.commit_turn(session_id):
-                await send_json(event_to_dict(event))
+                if not await send_json(event_to_dict(event)):
+                    return
         except asyncio.CancelledError:
             if isinstance(session_id, str):
                 self.engine.cancel_response(session_id)
             raise
+        except ConnectionClosed:
+            return
         except Exception as exc:
             logger.exception("audio.commit failed for session %s", request.get("session_id"))
             await send_json(
@@ -258,12 +284,20 @@ class VoicebotWebSocketServer:
             return None
         return payload
 
-    async def _send_error(self, websocket, error_event: ErrorEvent, send_json=None) -> None:
+    async def _send_error(
+        self,
+        websocket,
+        error_event: ErrorEvent,
+        send_json: Callable[[dict[str, Any]], Awaitable[bool]] | None = None,
+    ) -> None:
         payload = event_to_dict(error_event)
         if send_json is not None:
             await send_json(payload)
             return
-        await websocket.send(json.dumps(payload, ensure_ascii=True))
+        try:
+            await websocket.send(json.dumps(payload, ensure_ascii=True))
+        except ConnectionClosed:
+            return
 
 
 __all__ = ["VoicebotWebSocketServer"]

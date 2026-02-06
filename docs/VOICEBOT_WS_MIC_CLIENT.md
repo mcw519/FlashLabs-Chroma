@@ -49,6 +49,13 @@ python scripts/run_voicebot_ws_mic_client.py \
   --speaker scarlett_johansson
 ```
 
+At startup, the client will prompt for:
+- Microphone device
+- Speaker device (or `none` to disable playback)
+
+During runtime:
+- Type `/quit` and press Enter to disconnect cleanly.
+
 What the mic client does:
 
 - Captures microphone in real time (16k mono PCM16)
@@ -80,6 +87,8 @@ Audio devices:
 - `--input-device`: input device name or index
 - `--output-device`: output device name or index
 - `--disable-playback`: disable local playback
+- `--no-device-prompt`: skip startup interactive device selection
+- `--no-color`: disable colorized console output
 
 ## 6. WebSocket Event Flow
 

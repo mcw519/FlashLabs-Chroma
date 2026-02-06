@@ -249,6 +249,8 @@ python scripts/run_voicebot_ws_mic_client.py \
 
 The mic client auto-detects speech and sends `audio.commit` on pause, and will send
 `response.cancel` automatically when barge-in is detected during model playback.
+At startup it prompts for microphone/speaker device selection, and you can type `/quit`
+to disconnect gracefully.
 
 Detailed guide: `docs/VOICEBOT_WS_MIC_CLIENT.md`
 
