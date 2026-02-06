@@ -253,6 +253,7 @@ At startup it prompts for microphone/speaker device selection, and you can type 
 to disconnect gracefully.
 
 Detailed guide: `docs/VOICEBOT_WS_MIC_CLIENT.md`
+Streaming runtime internals: `docs/CHROMA_STREAMING_RUNTIME.md`
 
 ## Troubleshooting
 

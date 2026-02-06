@@ -72,6 +72,15 @@ def _clip_text(text: str | None, max_chars: int = 160) -> str:
         return stripped
     return stripped[: max_chars - 3] + "..."
 
+
+_ANSI_RESET = "\033[0m"
+_ANSI_QUERY = "\033[38;5;214m"
+_ANSI_HISTORY = "\033[38;5;45m"
+
+
+def _colorize(text: str, color: str) -> str:
+    return f"{color}{text}{_ANSI_RESET}"
+
 PROMPT_SPEAKERS = [
     "scarlett_johansson",
     "ariana_grande",
@@ -530,7 +539,14 @@ class StreamingVoicebotEngine:
             return
 
         try:
-            inputs = self._prepare_inputs(audio_16k, config.speaker, state)
+            inputs = self._prepare_inputs(
+                audio_16k,
+                config.speaker,
+                state,
+                session_id=session_id,
+                turn_id=turn_id,
+                query_text=user_text,
+            )
             logger.debug(
                 "commit_turn inputs ready session_id=%s turn_id=%s keys=%s",
                 session_id,
@@ -832,10 +848,19 @@ class StreamingVoicebotEngine:
         audio_np: np.ndarray,
         speaker: str,
         state: _SessionState,
+        session_id: str,
+        turn_id: str,
+        query_text: str | None,
     ) -> dict[str, torch.Tensor]:
         logger.debug("prepare_inputs start speaker=%s audio_shape=%s", speaker, _shape(audio_np))
         prompt_text, prompt_audio = self._load_prompt(speaker)
         memory_context = self._memory_context(state)
+        self._log_input_context(
+            session_id=session_id,
+            turn_id=turn_id,
+            memory_context=memory_context,
+            query_text=query_text,
+        )
         system_text = SYSTEM_PROMPT
         if memory_context:
             system_text = f"{SYSTEM_PROMPT}\n\n{memory_context}"
@@ -862,6 +887,32 @@ class StreamingVoicebotEngine:
             {k: _shape(v) for k, v in moved.items()},
         )
         return moved
+
+    def _log_input_context(
+        self,
+        session_id: str,
+        turn_id: str,
+        memory_context: str,
+        query_text: str | None,
+    ) -> None:
+        query_preview = _clip_text(query_text, max_chars=220) if query_text else "(audio-only; no transcript)"
+        history_preview = (
+            _clip_text(memory_context.replace("\n", " | "), max_chars=460)
+            if memory_context
+            else "(empty memory context)"
+        )
+        logger.info(
+            "input context session_id=%s turn_id=%s %s",
+            session_id,
+            turn_id,
+            _colorize(f"QUERY   {query_preview}", _ANSI_QUERY),
+        )
+        logger.info(
+            "input context session_id=%s turn_id=%s %s",
+            session_id,
+            turn_id,
+            _colorize(f"HISTORY {history_preview}", _ANSI_HISTORY),
+        )
 
     @torch.no_grad()
     def _generate_text(self, inputs: dict[str, torch.Tensor], text_mode: str) -> str | None:
