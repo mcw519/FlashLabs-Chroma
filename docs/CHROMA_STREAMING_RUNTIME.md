@@ -240,6 +240,10 @@ Memory 只在兩個時機點被寫入：
 `response.done.metrics` 目前包含：
 - `raw_audio_sec`
 - `trimmed_audio_sec`
+- `audio_out_sec`：本回合實際輸出的語音秒數（24kHz）
+- `audio_tokens`：估算 audio tokens（`audio_out_sec * frame_rate * audio_num_codebooks`）
+- `tokens_per_sec`：`audio_tokens / (response.started -> response.done 經過秒數)`
+- `tokens_per_sec_post_ttfs`：扣除 TTFS 後的 tokens/s
 - `ttfs_ms`：first chunk latency
 - `first_decode_ms`
 - `chunk_gap_ms`：chunk 間平均間隔

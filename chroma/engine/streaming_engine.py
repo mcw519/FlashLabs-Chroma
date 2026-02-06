@@ -583,6 +583,10 @@ class StreamingVoicebotEngine:
         event_queue: asyncio.Queue[EngineEvent | None] = asyncio.Queue()
 
         started_at = time.perf_counter()
+        frame_rate = float(getattr(self.model.config.codec_config, "frame_rate", 12.5))
+        num_codebooks = int(getattr(self.model.config.decoder_config, "audio_num_codebooks", 1))
+        if num_codebooks <= 0:
+            num_codebooks = 1
         metrics: dict[str, float] = {
             "raw_audio_sec": raw_seconds,
             "trimmed_audio_sec": trimmed_seconds,
@@ -590,10 +594,15 @@ class StreamingVoicebotEngine:
             "first_decode_ms": -1.0,
             "chunk_gap_ms": -1.0,
             "cancel_to_stop_ms": -1.0,
+            "audio_out_sec": 0.0,
+            "audio_tokens": 0.0,
+            "tokens_per_sec": -1.0,
+            "tokens_per_sec_post_ttfs": -1.0,
         }
         first_chunk_ts: float | None = None
         last_chunk_ts: float | None = None
         chunk_gaps: list[float] = []
+        total_output_samples = 0
 
         def emit(event: EngineEvent) -> None:
             logger.debug(
@@ -611,6 +620,18 @@ class StreamingVoicebotEngine:
                 metrics["first_decode_ms"] = metrics["ttfs_ms"]
             if chunk_gaps:
                 metrics["chunk_gap_ms"] = sum(chunk_gaps) / len(chunk_gaps)
+
+            elapsed_sec = max(1e-9, time.perf_counter() - started_at)
+            audio_out_sec = total_output_samples / float(OUTPUT_SAMPLE_RATE)
+            audio_tokens = audio_out_sec * frame_rate * float(num_codebooks)
+            metrics["audio_out_sec"] = audio_out_sec
+            metrics["audio_tokens"] = audio_tokens
+            metrics["tokens_per_sec"] = audio_tokens / elapsed_sec
+            if metrics["ttfs_ms"] >= 0.0:
+                post_ttfs_sec = elapsed_sec - (metrics["ttfs_ms"] / 1000.0)
+                if post_ttfs_sec > 1e-9:
+                    metrics["tokens_per_sec_post_ttfs"] = audio_tokens / post_ttfs_sec
+
             cancel_requested_at = None
             with state.lock:
                 cancel_requested_at = state.cancel_requested_at
@@ -625,6 +646,18 @@ class StreamingVoicebotEngine:
                 cancelled,
                 _clip_text(text_output),
                 metrics,
+            )
+            logger.info(
+                "audio throughput session_id=%s turn_id=%s audio_tokens=%.2f tokens_per_sec=%.2f post_ttfs=%.2f "
+                "audio_out_sec=%.3f frame_rate=%.2f codebooks=%s",
+                session_id,
+                turn_id,
+                metrics["audio_tokens"],
+                metrics["tokens_per_sec"],
+                metrics["tokens_per_sec_post_ttfs"],
+                metrics["audio_out_sec"],
+                frame_rate,
+                num_codebooks,
             )
 
             if cancelled:
@@ -649,7 +682,7 @@ class StreamingVoicebotEngine:
             loop.call_soon_threadsafe(event_queue.put_nowait, None)
 
         def on_audio_chunk(audio_chunk: np.ndarray) -> None:
-            nonlocal first_chunk_ts, last_chunk_ts
+            nonlocal first_chunk_ts, last_chunk_ts, total_output_samples
             now = time.perf_counter()
             if first_chunk_ts is None:
                 first_chunk_ts = now
@@ -662,6 +695,7 @@ class StreamingVoicebotEngine:
             if last_chunk_ts is not None:
                 chunk_gaps.append((now - last_chunk_ts) * 1000.0)
             last_chunk_ts = now
+            total_output_samples += int(audio_chunk.shape[-1])
 
             pcm16 = float32_to_pcm16le_bytes(audio_chunk[0])
             audio_b64 = base64.b64encode(pcm16).decode("ascii")
@@ -682,7 +716,6 @@ class StreamingVoicebotEngine:
             )
 
         def run_generation() -> None:
-            frame_rate = float(getattr(self.model.config.codec_config, "frame_rate", 12.5))
             frames_per_chunk = max(
                 1,
                 int(round(config.output_chunk_sec * frame_rate)),
