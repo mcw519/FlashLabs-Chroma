@@ -176,6 +176,44 @@ audio_values = model.codec_model.decode(output.permute(0, 2, 1)).audio_values
 Audio(audio_values[0].cpu().detach().numpy(), rate=24_000)
 ```
 
+### Realtime WebRTC Demo (FastRTC + Gradio)
+
+This demo streams audio via WebRTC using FastRTC with Silero-VAD turn-taking and a Gradio UI.
+Audio replies are emitted incrementally as the model generates; `--output-chunk-sec` controls chunk cadence.
+
+Handler I/O schema (send-receive audio mode):
+```python
+def reply(
+    audio: tuple[int, np.ndarray],  # (sample_rate, mono waveform) from mic
+    webrtc_id: str,                 # session id
+    speaker: str,                   # dropdown value
+) -> Iterator[tuple[int, np.ndarray]]:  # yields (sample_rate, mono waveform)
+    ...
+```
+
+```bash
+# Install realtime demo dependencies (FastRTC + Gradio + Silero-VAD)
+uv sync
+
+# Launch the WebRTC UI
+python scripts/run_realtime_webrtc.py \
+  --use-half-precision \
+  --prompt-speaker scarlett_johansson
+```
+
+Then open http://localhost:7860 and speak into the mic to receive audio replies.
+
+If running on a remote host/NAT, provide ICE servers (STUN/TURN) for WebRTC:
+```bash
+python scripts/run_realtime_webrtc.py \
+  --ice-server stun:stun.l.google.com:19302
+```
+
+To disable text generation (audio only):
+```bash
+python scripts/run_realtime_webrtc.py --disable-text
+```
+
 ## Troubleshooting
 
 ### Common Issues
