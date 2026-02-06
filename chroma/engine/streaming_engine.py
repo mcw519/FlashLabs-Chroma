@@ -63,6 +63,15 @@ def _shape(value: Any) -> str:
         return str(value.shape)
     return type(value).__name__
 
+
+def _clip_text(text: str | None, max_chars: int = 160) -> str:
+    if not text:
+        return ""
+    stripped = text.strip().replace("\n", " ")
+    if len(stripped) <= max_chars:
+        return stripped
+    return stripped[: max_chars - 3] + "..."
+
 PROMPT_SPEAKERS = [
     "scarlett_johansson",
     "ariana_grande",
@@ -128,7 +137,7 @@ class _EngineAudioStreamer(BaseStreamer):
         self.num_codebooks = model.config.decoder_config.audio_num_codebooks
         self._buffer: list[torch.Tensor] = []
         self._closed = False
-        logger.info(
+        logger.debug(
             "%sstreamer initialized frames_per_chunk=%s num_codebooks=%s",
             self.log_prefix,
             frames_per_chunk,
@@ -137,7 +146,7 @@ class _EngineAudioStreamer(BaseStreamer):
 
     def put(self, value) -> None:
         if self.cancel_event.is_set():
-            logger.info("%sstreamer cancel flag observed in put()", self.log_prefix)
+            logger.debug("%sstreamer cancel flag observed in put()", self.log_prefix)
             raise GenerationCancelled("Generation cancelled")
         if self._closed:
             logger.debug("%sstreamer ignored put() because streamer closed", self.log_prefix)
@@ -173,10 +182,10 @@ class _EngineAudioStreamer(BaseStreamer):
 
     def _put_frame(self, tokens: torch.Tensor) -> None:
         if self.cancel_event.is_set():
-            logger.info("%sstreamer cancel flag observed in _put_frame()", self.log_prefix)
+            logger.debug("%sstreamer cancel flag observed in _put_frame()", self.log_prefix)
             raise GenerationCancelled("Generation cancelled")
         if (tokens == self.eos_token_id).all():
-            logger.info("%sstreamer EOS frame received; ending stream", self.log_prefix)
+            logger.debug("%sstreamer EOS frame received; ending stream", self.log_prefix)
             self.end()
             return
         self._buffer.append(tokens)
@@ -193,7 +202,7 @@ class _EngineAudioStreamer(BaseStreamer):
         if self._closed:
             return
         self._closed = True
-        logger.info(
+        logger.debug(
             "%sstreamer end() flushing remaining_frames=%s",
             self.log_prefix,
             len(self._buffer),
@@ -210,7 +219,7 @@ class _EngineAudioStreamer(BaseStreamer):
         if audio_np.size == 0:
             logger.debug("%sstreamer decoded empty audio chunk; skip emit", self.log_prefix)
             return
-        logger.info(
+        logger.debug(
             "%sstreamer emit audio_chunk shape=%s samples=%s",
             self.log_prefix,
             _shape(audio_np),
@@ -249,7 +258,7 @@ class StreamingVoicebotEngine:
         warmup: bool = False,
     ) -> None:
         _configure_engine_logging()
-        logger.info(
+        logger.debug(
             "engine init start model_path=%s half_precision=%s max_new_tokens=%s max_text_new_tokens=%s "
             "temperature=%s top_p=%s output_chunk_sec=%s default_speaker=%s enable_text=%s max_sessions=%s max_input_seconds=%s warmup=%s",
             model_path,
@@ -289,20 +298,19 @@ class StreamingVoicebotEngine:
         self._prompt_cache: dict[str, tuple[list[str], list[str]]] = {}
 
         self._vad_model = load_silero_vad()
-        logger.info("silero VAD model loaded")
+        logger.debug("silero VAD model loaded")
 
         if warmup:
             self.warmup()
         logger.info(
-            "engine init done device=%s dtype=%s max_input_bytes=%s speaker=%s",
+            "engine ready device=%s dtype=%s speaker=%s",
             self.device,
             self.model_dtype,
-            self.max_input_bytes,
             self.default_speaker,
         )
 
     def warmup(self) -> None:
-        logger.info("warmup start")
+        logger.debug("warmup start")
         audio = np.zeros(INPUT_SAMPLE_RATE, dtype=np.float32)
         config = SessionConfig(speaker=self.default_speaker, output_chunk_sec=0.2, text_mode="none")
         self.create_session("__warmup__", config)
@@ -314,15 +322,15 @@ class StreamingVoicebotEngine:
 
         try:
             asyncio.run(_run_warmup())
-            logger.info("warmup generation finished")
+            logger.debug("warmup generation finished")
         except Exception:
             logger.exception("Warmup failed")
         finally:
             self.close_session("__warmup__")
-            logger.info("warmup end")
+            logger.debug("warmup end")
 
     def create_session(self, session_id: str, config: SessionConfig) -> None:
-        logger.info("create_session session_id=%s requested_config=%s", session_id, config)
+        logger.debug("create_session session_id=%s requested_config=%s", session_id, config)
         config = self._normalize_config(config)
         with self._sessions_lock:
             if session_id not in self._sessions and len(self._sessions) >= self.max_sessions:
@@ -336,7 +344,7 @@ class StreamingVoicebotEngine:
             state = self._sessions.get(session_id)
             if state is None:
                 self._sessions[session_id] = _SessionState(config=config)
-                logger.info(
+                logger.debug(
                     "session created session_id=%s total_sessions=%s config=%s",
                     session_id,
                     len(self._sessions),
@@ -345,10 +353,10 @@ class StreamingVoicebotEngine:
                 return
         with state.lock:
             state.config = config
-        logger.info("session updated via create_session session_id=%s config=%s", session_id, config)
+        logger.debug("session updated via create_session session_id=%s config=%s", session_id, config)
 
     def update_session(self, session_id: str, **kwargs: Any) -> None:
-        logger.info("update_session session_id=%s kwargs=%s", session_id, kwargs)
+        logger.debug("update_session session_id=%s kwargs=%s", session_id, kwargs)
         state = self._get_session(session_id)
         with state.lock:
             config = state.config
@@ -365,13 +373,13 @@ class StreamingVoicebotEngine:
                 text_mode=config.text_mode if text_mode is None else text_mode,
             )
             state.config = self._normalize_config(merged)
-            logger.info("session config updated session_id=%s config=%s", session_id, state.config)
+            logger.debug("session config updated session_id=%s config=%s", session_id, state.config)
 
     def set_pending_user_text(self, session_id: str, text: str | None) -> None:
         state = self._get_session(session_id)
         with state.lock:
             state.pending_user_text = (text or "").strip() or None
-            logger.info(
+            logger.debug(
                 "set_pending_user_text session_id=%s has_text=%s length=%s",
                 session_id,
                 state.pending_user_text is not None,
@@ -389,14 +397,20 @@ class StreamingVoicebotEngine:
             overflow = len(state.audio_buffer) - self.max_input_bytes
             if overflow > 0:
                 del state.audio_buffer[:overflow]
-            logger.info(
-                "append_audio session_id=%s bytes_in=%s buffer_before=%s buffer_after=%s overflow_trimmed=%s",
-                session_id,
-                len(pcm16_16k),
-                prev_size,
-                len(state.audio_buffer),
-                max(0, overflow),
-            )
+                logger.warning(
+                    "append_audio overflow trimmed session_id=%s overflow_bytes=%s buffer_after=%s",
+                    session_id,
+                    overflow,
+                    len(state.audio_buffer),
+                )
+            elif logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "append_audio session_id=%s bytes_in=%s buffer_before=%s buffer_after=%s",
+                    session_id,
+                    len(pcm16_16k),
+                    prev_size,
+                    len(state.audio_buffer),
+                )
 
     def cancel_response(self, session_id: str) -> None:
         logger.info("cancel_response requested session_id=%s", session_id)
@@ -405,16 +419,20 @@ class StreamingVoicebotEngine:
             state.cancel_requested_at = time.perf_counter()
             if state.active_cancel_event is not None:
                 state.active_cancel_event.set()
-                logger.info("cancel flag set for active turn session_id=%s turn_id=%s", session_id, state.active_turn_id)
+                logger.info(
+                    "cancel flag set session_id=%s turn_id=%s",
+                    session_id,
+                    state.active_turn_id,
+                )
             else:
-                logger.info("no active turn to cancel session_id=%s", session_id)
+                logger.debug("no active turn to cancel session_id=%s", session_id)
 
     def close_session(self, session_id: str) -> None:
-        logger.info("close_session start session_id=%s", session_id)
+        logger.debug("close_session start session_id=%s", session_id)
         with self._sessions_lock:
             state = self._sessions.pop(session_id, None)
         if state is None:
-            logger.info("close_session skipped missing session_id=%s", session_id)
+            logger.debug("close_session skipped missing session_id=%s", session_id)
             return
         with state.lock:
             if state.active_cancel_event is not None:
@@ -422,8 +440,8 @@ class StreamingVoicebotEngine:
             thread = state.active_thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=1.0)
-            logger.info("close_session joined active thread session_id=%s", session_id)
-        logger.info("close_session done session_id=%s", session_id)
+            logger.debug("close_session joined active thread session_id=%s", session_id)
+        logger.debug("close_session done session_id=%s", session_id)
 
     async def commit_turn(self, session_id: str) -> AsyncIterator[EngineEvent]:
         logger.info("commit_turn start session_id=%s", session_id)
@@ -454,7 +472,7 @@ class StreamingVoicebotEngine:
             state.active_cancel_event = cancel_event
             state.active_thread = None
             state.cancel_requested_at = None
-            logger.info(
+            logger.debug(
                 "commit_turn prepared session_id=%s turn_id=%s audio_bytes=%s pending_user_text=%s config=%s",
                 session_id,
                 turn_id,
@@ -479,7 +497,7 @@ class StreamingVoicebotEngine:
         audio_np = pcm16le_bytes_to_float32_mono(audio_bytes)
         audio_16k = _resample_audio(audio_np, INPUT_SAMPLE_RATE, INPUT_SAMPLE_RATE)
         raw_seconds = audio_16k.shape[-1] / INPUT_SAMPLE_RATE
-        logger.info(
+        logger.debug(
             "commit_turn audio decoded session_id=%s turn_id=%s shape=%s raw_seconds=%.3f",
             session_id,
             turn_id,
@@ -488,7 +506,7 @@ class StreamingVoicebotEngine:
         )
         audio_16k = self._trim_with_vad(audio_16k)
         trimmed_seconds = audio_16k.shape[-1] / INPUT_SAMPLE_RATE
-        logger.info(
+        logger.debug(
             "commit_turn vad trimmed session_id=%s turn_id=%s trimmed_seconds=%.3f",
             session_id,
             turn_id,
@@ -513,7 +531,7 @@ class StreamingVoicebotEngine:
 
         try:
             inputs = self._prepare_inputs(audio_16k, config.speaker, state)
-            logger.info(
+            logger.debug(
                 "commit_turn inputs ready session_id=%s turn_id=%s keys=%s",
                 session_id,
                 turn_id,
@@ -573,11 +591,11 @@ class StreamingVoicebotEngine:
                     0.0, (time.perf_counter() - cancel_requested_at) * 1000.0
                 )
             logger.info(
-                "finalize turn session_id=%s turn_id=%s cancelled=%s text_output=%s metrics=%s",
+                "response complete session_id=%s turn_id=%s cancelled=%s text=\"%s\" metrics=%s",
                 session_id,
                 turn_id,
                 cancelled,
-                text_output is not None,
+                _clip_text(text_output),
                 metrics,
             )
 
@@ -641,7 +659,7 @@ class StreamingVoicebotEngine:
                 1,
                 int(round(config.output_chunk_sec * frame_rate)),
             )
-            logger.info(
+            logger.debug(
                 "generation thread start session_id=%s turn_id=%s frame_rate=%s frames_per_chunk=%s",
                 session_id,
                 turn_id,
@@ -656,7 +674,7 @@ class StreamingVoicebotEngine:
                 log_prefix=f"[{session_id}:{turn_id}] ",
             )
             try:
-                logger.info("model.generate begin session_id=%s turn_id=%s", session_id, turn_id)
+                logger.debug("model.generate begin session_id=%s turn_id=%s", session_id, turn_id)
                 self.model.generate(
                     **inputs,
                     max_new_tokens=self.max_new_tokens,
@@ -667,10 +685,10 @@ class StreamingVoicebotEngine:
                     streamer=streamer,
                     stopping_criteria=StoppingCriteriaList([AbortOnCancelCriteria(cancel_event)]),
                 )
-                logger.info("model.generate end session_id=%s turn_id=%s", session_id, turn_id)
+                logger.debug("model.generate end session_id=%s turn_id=%s", session_id, turn_id)
                 streamer.end()
                 if cancel_event.is_set():
-                    logger.info("generation cancelled before finalize session_id=%s turn_id=%s", session_id, turn_id)
+                    logger.info("generation cancelled session_id=%s turn_id=%s", session_id, turn_id)
                     finalize(cancelled=True)
                     return
 
@@ -693,20 +711,20 @@ class StreamingVoicebotEngine:
                 loop.call_soon_threadsafe(event_queue.put_nowait, None)
             finally:
                 self._clear_active_turn(state, turn_id)
-                logger.info("generation thread cleanup done session_id=%s turn_id=%s", session_id, turn_id)
+                logger.debug("generation thread cleanup done session_id=%s turn_id=%s", session_id, turn_id)
 
         worker = threading.Thread(target=run_generation, daemon=True)
         with state.lock:
             state.active_thread = worker
         emit(ResponseStartedEvent(session_id=session_id, turn_id=turn_id))
-        logger.info("response.started emitted session_id=%s turn_id=%s", session_id, turn_id)
+        logger.info("response started session_id=%s turn_id=%s", session_id, turn_id)
         worker.start()
-        logger.info("generation thread started session_id=%s turn_id=%s", session_id, turn_id)
+        logger.debug("generation thread started session_id=%s turn_id=%s", session_id, turn_id)
 
         while True:
             event = await event_queue.get()
             if event is None:
-                logger.info("commit_turn end-of-stream marker session_id=%s turn_id=%s", session_id, turn_id)
+                logger.debug("commit_turn end-of-stream marker session_id=%s turn_id=%s", session_id, turn_id)
                 break
             logger.debug(
                 "commit_turn yielding event session_id=%s turn_id=%s event_type=%s",
@@ -718,7 +736,7 @@ class StreamingVoicebotEngine:
         logger.info("commit_turn done session_id=%s turn_id=%s", session_id, turn_id)
 
     def commit_turn_sync(self, session_id: str) -> Iterator[EngineEvent]:
-        logger.info("commit_turn_sync start session_id=%s", session_id)
+        logger.debug("commit_turn_sync start session_id=%s", session_id)
         output_queue: queue.SimpleQueue[EngineEvent | None] = queue.SimpleQueue()
 
         def _runner() -> None:
@@ -739,7 +757,7 @@ class StreamingVoicebotEngine:
                 )
             finally:
                 output_queue.put(None)
-                logger.info("commit_turn_sync runner finished session_id=%s", session_id)
+                logger.debug("commit_turn_sync runner finished session_id=%s", session_id)
 
         threading.Thread(target=_runner, daemon=True).start()
 
@@ -748,7 +766,7 @@ class StreamingVoicebotEngine:
             if item is None:
                 break
             yield item
-        logger.info("commit_turn_sync end session_id=%s", session_id)
+        logger.debug("commit_turn_sync end session_id=%s", session_id)
 
     def _trim_with_vad(self, audio_16k: np.ndarray) -> np.ndarray:
         logger.debug("vad trim start audio_shape=%s", _shape(audio_16k))
@@ -757,7 +775,7 @@ class StreamingVoicebotEngine:
             audio_tensor, self._vad_model, sampling_rate=INPUT_SAMPLE_RATE
         )
         if not speech_timestamps:
-            logger.info("vad found no speech; keep original audio")
+            logger.debug("vad found no speech; keep original audio")
             return audio_16k
         start = speech_timestamps[0]["start"]
         end = speech_timestamps[-1]["end"]
@@ -765,7 +783,7 @@ class StreamingVoicebotEngine:
         if trimmed.numel() == 0:
             logger.warning("vad produced empty trim; keep original audio")
             return audio_16k
-        logger.info(
+        logger.debug(
             "vad trim result start=%s end=%s kept_samples=%s",
             start,
             end,
@@ -781,7 +799,7 @@ class StreamingVoicebotEngine:
         repo_root = Path(__file__).resolve().parents[2]
         text_path = repo_root / "example" / "prompt_text" / f"{speaker}.txt"
         audio_path = repo_root / "example" / "prompt_audio" / f"{speaker}.wav"
-        logger.info("loading prompt speaker=%s text=%s audio=%s", speaker, text_path, audio_path)
+        logger.debug("loading prompt speaker=%s text=%s audio=%s", speaker, text_path, audio_path)
         prompt_text = text_path.read_text(encoding="utf-8")
         payload = ([prompt_text], [str(audio_path)])
         self._prompt_cache[speaker] = payload
@@ -802,7 +820,7 @@ class StreamingVoicebotEngine:
             return ""
         max_entries = max(1, state.config.memory_turns * 2)
         clipped = state.memory[-max_entries:]
-        logger.info("memory context build entries=%s max_entries=%s", len(clipped), max_entries)
+        logger.debug("memory context build entries=%s max_entries=%s", len(clipped), max_entries)
         lines = ["Recent conversation summary:"]
         for item in clipped:
             role = "User" if item.role == "user" else "Assistant"
@@ -815,7 +833,7 @@ class StreamingVoicebotEngine:
         speaker: str,
         state: _SessionState,
     ) -> dict[str, torch.Tensor]:
-        logger.info("prepare_inputs start speaker=%s audio_shape=%s", speaker, _shape(audio_np))
+        logger.debug("prepare_inputs start speaker=%s audio_shape=%s", speaker, _shape(audio_np))
         prompt_text, prompt_audio = self._load_prompt(speaker)
         memory_context = self._memory_context(state)
         system_text = SYSTEM_PROMPT
@@ -838,7 +856,7 @@ class StreamingVoicebotEngine:
             prompt_text=prompt_text,
         )
         moved = {k: self._move_to_device(v) for k, v in inputs.items()}
-        logger.info(
+        logger.debug(
             "prepare_inputs done keys=%s shapes=%s",
             sorted(moved.keys()),
             {k: _shape(v) for k, v in moved.items()},
@@ -847,13 +865,13 @@ class StreamingVoicebotEngine:
 
     @torch.no_grad()
     def _generate_text(self, inputs: dict[str, torch.Tensor], text_mode: str) -> str | None:
-        logger.info("generate_text start enabled=%s text_mode=%s", self.enable_text, text_mode)
+        logger.debug("generate_text start enabled=%s text_mode=%s", self.enable_text, text_mode)
         if not self.enable_text or text_mode == "none":
-            logger.info("generate_text skipped by config")
+            logger.debug("generate_text skipped by config")
             return None
         thinker_input_ids = inputs.get("thinker_input_ids")
         if thinker_input_ids is None:
-            logger.info("generate_text skipped no thinker_input_ids")
+            logger.debug("generate_text skipped no thinker_input_ids")
             return None
 
         output_ids = self.model.thinker.generate(
@@ -870,22 +888,22 @@ class StreamingVoicebotEngine:
         prompt_len = thinker_input_ids.shape[1]
         generated_ids = output_ids[0, prompt_len:]
         if generated_ids.numel() == 0:
-            logger.info("generate_text empty generated ids")
+            logger.debug("generate_text empty generated ids")
             return None
         text = self.processor.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
         if not text:
-            logger.info("generate_text decoded empty text")
+            logger.debug("generate_text decoded empty text")
             return None
         if text_mode == "final":
-            logger.info("generate_text final mode length=%s", len(text))
+            logger.debug("generate_text final mode length=%s", len(text))
             return text
         # sentence mode: keep first complete sentence if possible
         for delimiter in [". ", "! ", "? ", "。", "！", "？"]:
             if delimiter in text:
                 sentence = text.split(delimiter, 1)[0].strip() + delimiter.strip()
-                logger.info("generate_text sentence mode length=%s", len(sentence))
+                logger.debug("generate_text sentence mode length=%s", len(sentence))
                 return sentence
-        logger.info("generate_text sentence fallback full length=%s", len(text))
+        logger.debug("generate_text sentence fallback full length=%s", len(text))
         return text
 
     def _append_memory(self, state: _SessionState, role: str, text: str) -> None:
@@ -894,13 +912,13 @@ class StreamingVoicebotEngine:
         with state.lock:
             if state.config.memory_turns <= 0:
                 state.memory.clear()
-                logger.info("append_memory skipped because memory_turns<=0")
+                logger.debug("append_memory skipped because memory_turns<=0")
                 return
             state.memory.append(_MemoryItem(role=role, text=text))
             max_entries = max(1, state.config.memory_turns * 2)
             if len(state.memory) > max_entries:
                 del state.memory[:-max_entries]
-            logger.info(
+            logger.debug(
                 "append_memory role=%s text_len=%s memory_size=%s max_entries=%s",
                 role,
                 len(text),
@@ -914,7 +932,7 @@ class StreamingVoicebotEngine:
                 state.active_turn_id = None
                 state.active_cancel_event = None
                 state.active_thread = None
-                logger.info("cleared active turn turn_id=%s", turn_id)
+                logger.debug("cleared active turn turn_id=%s", turn_id)
 
     def _normalize_config(self, config: SessionConfig) -> SessionConfig:
         logger.debug("normalize_config input=%s", config)
@@ -953,10 +971,10 @@ class StreamingVoicebotEngine:
         return state
 
     def _resolve_local_model_path(self, local_path: str) -> str:
-        logger.info("resolve_local_model_path input=%s", local_path)
+        logger.debug("resolve_local_model_path input=%s", local_path)
         path = Path(local_path)
         if (path / "config.json").is_file():
-            logger.info("resolve_local_model_path direct config.json found")
+            logger.debug("resolve_local_model_path direct config.json found")
             return str(path)
 
         snapshots_dir = path / "snapshots"
@@ -965,12 +983,12 @@ class StreamingVoicebotEngine:
             if ref_path.is_file():
                 snapshot = snapshots_dir / ref_path.read_text().strip()
                 if (snapshot / "config.json").is_file():
-                    logger.info("resolve_local_model_path resolved via refs/main")
+                    logger.debug("resolve_local_model_path resolved via refs/main")
                     return str(snapshot)
 
             snapshot_dirs = [p for p in snapshots_dir.iterdir() if p.is_dir()]
             if len(snapshot_dirs) == 1 and (snapshot_dirs[0] / "config.json").is_file():
-                logger.info("resolve_local_model_path resolved via single snapshot")
+                logger.debug("resolve_local_model_path resolved via single snapshot")
                 return str(snapshot_dirs[0])
 
             raise ValueError(
@@ -978,7 +996,7 @@ class StreamingVoicebotEngine:
                 "directory (e.g. .../snapshots/<hash>)."
             )
 
-        logger.info("resolve_local_model_path fallback=%s", path)
+        logger.debug("resolve_local_model_path fallback=%s", path)
         return str(path)
 
     def _load_chroma_model(
@@ -987,7 +1005,7 @@ class StreamingVoicebotEngine:
         *,
         use_half_precision: bool,
     ):
-        logger.info(
+        logger.debug(
             "load_chroma_model start from_local_path=%s use_half_precision=%s",
             from_local_path,
             use_half_precision,
@@ -1003,13 +1021,13 @@ class StreamingVoicebotEngine:
             repo_root = Path(__file__).resolve().parents[2]
             cache_dir = repo_root / "pretrained_models"
             cache_dir.mkdir(parents=True, exist_ok=True)
-            logger.info("load_chroma_model cache_dir=%s", cache_dir)
+            logger.debug("load_chroma_model cache_dir=%s", cache_dir)
 
         torch_dtype = torch.float32
         if use_half_precision:
             if torch.cuda.is_available():
                 torch_dtype = torch.float16
-                logger.info("load_chroma_model using fp16")
+                logger.debug("load_chroma_model using fp16")
             else:
                 logger.warning(
                     "Half precision requested but CUDA is unavailable; using fp32."
@@ -1023,14 +1041,14 @@ class StreamingVoicebotEngine:
             cache_dir=str(cache_dir) if cache_dir else None,
             torch_dtype=torch_dtype,
         ).eval()
-        logger.info("load_chroma_model model loaded device=%s dtype=%s", model.device, model.dtype)
+        logger.info("model loaded device=%s dtype=%s", model.device, model.dtype)
 
         processor = AutoProcessor.from_pretrained(
             model_id,
             trust_remote_code=True,
             cache_dir=str(cache_dir) if cache_dir else None,
         )
-        logger.info("load_chroma_model processor loaded")
+        logger.info("processor loaded")
 
         return model, processor
 
