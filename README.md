@@ -259,6 +259,13 @@ Minimal client event flow:
 {"type":"audio.commit","session_id":"demo-1","transcript":"optional user text"}
 ```
 
+Per-session persona override:
+```json
+{"type":"session.start","session_id":"demo-2","config":{"system_prompt":"You are a concise travel concierge."}}
+{"type":"session.update","session_id":"demo-2","config":{"system_prompt":"You are a strict interview coach."}}
+{"type":"session.update","session_id":"demo-2","config":{"system_prompt":null}}
+```
+
 `include_transcript_in_query` defaults to `false` (current behavior): transcript is stored in memory only.
 Set it to `true` to include transcript in the same turn's user query (`text + audio`).
 When `--server-asr-model` is enabled on server, `audio.commit.transcript` from client is ignored.

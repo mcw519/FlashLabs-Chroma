@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import socket
 
 import websockets
@@ -11,6 +12,7 @@ from chroma.engine.types import (
     ResponseDoneEvent,
     ResponseStartedEvent,
     ResponseTextDeltaEvent,
+    SessionConfig,
 )
 from chroma.transport.ws_server import VoicebotWebSocketServer
 
@@ -21,12 +23,59 @@ class FakeEngine:
         self.cancel_count: dict[str, int] = {}
         self.pending_text: dict[str, str | None] = {}
 
+    @staticmethod
+    def _normalize_system_prompt(prompt):
+        if prompt is None:
+            return None
+        if not isinstance(prompt, str):
+            raise ValueError("system_prompt must be string or null")
+        normalized = prompt.strip()
+        if not normalized:
+            raise ValueError("system_prompt must not be empty")
+        if len(normalized) > 4000:
+            raise ValueError("system_prompt exceeds 4000 characters")
+        return normalized
+
     def create_session(self, session_id, config) -> None:
-        self.sessions[session_id] = {"config": config, "audio": bytearray()}
+        normalized_prompt = self._normalize_system_prompt(config.system_prompt)
+        normalized = SessionConfig(
+            speaker=config.speaker,
+            memory_turns=config.memory_turns,
+            output_chunk_sec=config.output_chunk_sec,
+            text_mode=config.text_mode,
+            include_transcript_in_query=config.include_transcript_in_query,
+            system_prompt=normalized_prompt,
+        )
+        self.sessions[session_id] = {"config": normalized, "audio": bytearray()}
 
     def update_session(self, session_id, **kwargs) -> None:
         if session_id not in self.sessions:
             raise ValueError("missing session")
+        config = self.sessions[session_id]["config"]
+        if "system_prompt" in kwargs:
+            system_prompt = self._normalize_system_prompt(kwargs.get("system_prompt"))
+        else:
+            system_prompt = config.system_prompt
+        self.sessions[session_id]["config"] = SessionConfig(
+            speaker=config.speaker if kwargs.get("speaker") is None else kwargs.get("speaker"),
+            memory_turns=(
+                config.memory_turns
+                if kwargs.get("memory_turns") is None
+                else kwargs.get("memory_turns")
+            ),
+            output_chunk_sec=(
+                config.output_chunk_sec
+                if kwargs.get("output_chunk_sec") is None
+                else kwargs.get("output_chunk_sec")
+            ),
+            text_mode=config.text_mode if kwargs.get("text_mode") is None else kwargs.get("text_mode"),
+            include_transcript_in_query=(
+                config.include_transcript_in_query
+                if kwargs.get("include_transcript_in_query") is None
+                else kwargs.get("include_transcript_in_query")
+            ),
+            system_prompt=system_prompt,
+        )
         self.sessions[session_id]["updates"] = kwargs
 
     def set_pending_user_text(self, session_id, text) -> None:
@@ -40,6 +89,9 @@ class FakeEngine:
 
     def close_session(self, session_id) -> None:
         self.sessions.pop(session_id, None)
+
+    def get_session_config(self, session_id):
+        return self.sessions[session_id]["config"]
 
     async def commit_turn(self, session_id):
         turn_id = "1"
@@ -158,6 +210,154 @@ def test_ws_invalid_payload_returns_error() -> None:
                 error = await ws.recv()
                 assert '"type": "error"' in error
                 assert "bad_json" in error
+        finally:
+            await _stop_server(task)
+
+    asyncio.run(_run())
+
+
+def test_ws_session_start_with_system_prompt() -> None:
+    async def _run() -> None:
+        engine, task, url = await _start_server()
+        try:
+            async with websockets.connect(url) as ws:
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "session.start",
+                            "session_id": "s3",
+                            "config": {"system_prompt": "  You are a tutor.  "},
+                        }
+                    )
+                )
+                started = json.loads(await ws.recv())
+                assert started["type"] == "session.started"
+                assert started["config"]["system_prompt"] == "You are a tutor."
+                assert engine.sessions["s3"]["config"].system_prompt == "You are a tutor."
+        finally:
+            await _stop_server(task)
+
+    asyncio.run(_run())
+
+
+def test_ws_session_update_set_and_clear_system_prompt() -> None:
+    async def _run() -> None:
+        engine, task, url = await _start_server()
+        try:
+            async with websockets.connect(url) as ws:
+                await ws.send(json.dumps({"type": "session.start", "session_id": "s4"}))
+                await ws.recv()
+
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "session.update",
+                            "session_id": "s4",
+                            "config": {"system_prompt": "Persona A"},
+                        }
+                    )
+                )
+                updated = json.loads(await ws.recv())
+                assert updated["type"] == "session.updated"
+                assert updated["config"]["system_prompt"] == "Persona A"
+                assert engine.sessions["s4"]["config"].system_prompt == "Persona A"
+
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "session.update",
+                            "session_id": "s4",
+                            "config": {"speaker": "ariana_grande"},
+                        }
+                    )
+                )
+                retained = json.loads(await ws.recv())
+                assert retained["type"] == "session.updated"
+                assert retained["config"]["system_prompt"] == "Persona A"
+                assert engine.sessions["s4"]["config"].system_prompt == "Persona A"
+
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "session.update",
+                            "session_id": "s4",
+                            "config": {"system_prompt": None},
+                        }
+                    )
+                )
+                cleared = json.loads(await ws.recv())
+                assert cleared["type"] == "session.updated"
+                assert cleared["config"]["system_prompt"] is None
+                assert engine.sessions["s4"]["config"].system_prompt is None
+        finally:
+            await _stop_server(task)
+
+    asyncio.run(_run())
+
+
+def test_ws_invalid_system_prompt_returns_request_failed() -> None:
+    async def _run() -> None:
+        _, task, url = await _start_server()
+        try:
+            async with websockets.connect(url) as ws:
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "session.start",
+                            "session_id": "s5",
+                            "config": {"system_prompt": "   "},
+                        }
+                    )
+                )
+                error = json.loads(await ws.recv())
+                assert error["type"] == "error"
+                assert error["code"] == "request_failed"
+                assert "system_prompt" in error["message"]
+        finally:
+            await _stop_server(task)
+
+    asyncio.run(_run())
+
+
+def test_ws_system_prompt_too_long_returns_request_failed() -> None:
+    async def _run() -> None:
+        _, task, url = await _start_server()
+        try:
+            async with websockets.connect(url) as ws:
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "session.start",
+                            "session_id": "s6",
+                            "config": {"system_prompt": "x" * 4001},
+                        }
+                    )
+                )
+                error = json.loads(await ws.recv())
+                assert error["type"] == "error"
+                assert error["code"] == "request_failed"
+                assert "4000" in error["message"]
+        finally:
+            await _stop_server(task)
+
+    asyncio.run(_run())
+
+
+def test_ws_audio_append_invalid_base64_returns_invalid_base64_code() -> None:
+    async def _run() -> None:
+        _, task, url = await _start_server()
+        try:
+            async with websockets.connect(url) as ws:
+                await ws.send(json.dumps({"type": "session.start", "session_id": "s7"}))
+                await ws.recv()
+                await ws.send(
+                    json.dumps(
+                        {"type": "audio.append", "session_id": "s7", "audio_b64": "###"}
+                    )
+                )
+                error = json.loads(await ws.recv())
+                assert error["type"] == "error"
+                assert error["code"] == "invalid_base64"
         finally:
             await _stop_server(task)
 

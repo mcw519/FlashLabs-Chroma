@@ -122,6 +122,18 @@ Client -> Server:
 ```
 
 ```json
+{"type":"session.start","session_id":"persona-demo","config":{"system_prompt":"You are a concise coding tutor."}}
+```
+
+```json
+{"type":"session.update","session_id":"persona-demo","config":{"system_prompt":"You are a strict reviewer."}}
+```
+
+```json
+{"type":"session.update","session_id":"persona-demo","config":{"system_prompt":null}}
+```
+
+```json
 {"type":"audio.append","session_id":"mic-demo","audio_b64":"..."}
 ```
 
