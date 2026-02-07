@@ -519,7 +519,7 @@ wheels = [
 [[package]]
 name = "flashlabs-chroma"
 version = "1.0.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
     { name = "audioread" },
