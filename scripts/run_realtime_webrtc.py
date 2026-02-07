@@ -30,10 +30,6 @@ from chroma.engine import (
     pcm16le_bytes_to_float32_mono,
 )
 
-SYSTEM_PROMPT = (
-    "You are Chroma, an advanced virtual human created by the FlashLabs. "
-    "You possess the ability to understand auditory inputs and generate both text and speech."
-)
 DEFAULT_ICE_SERVER = "stun:stun.l.google.com:19302"
 
 
@@ -77,6 +73,7 @@ class ChromaRealtimeEngine:
         output_chunk_sec: float,
         default_speaker: str,
         enable_text: bool,
+        bot_config_path: str | None,
     ) -> None:
         self.enable_text = enable_text
         self.output_chunk_sec = output_chunk_sec
@@ -92,6 +89,7 @@ class ChromaRealtimeEngine:
             default_speaker=default_speaker,
             enable_text=enable_text,
             max_sessions=3,
+            bot_config_path=bot_config_path,
         )
 
     def reply(
@@ -214,6 +212,12 @@ def build_stream(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Chroma realtime WebRTC demo")
     parser.add_argument("--model-path", type=str, default=None)
+    parser.add_argument(
+        "--bot-config",
+        type=str,
+        default=None,
+        help="Path to bot config (.json/.toml) with system_prompt",
+    )
     parser.add_argument("--prompt-speaker", type=str, default="scarlett_johansson")
     parser.add_argument("--max-new-tokens", type=int, default=200)
     parser.add_argument("--max-text-new-tokens", type=int, default=64)
@@ -245,6 +249,7 @@ def main() -> None:
         output_chunk_sec=args.output_chunk_sec,
         default_speaker=args.prompt_speaker,
         enable_text=not args.disable_text,
+        bot_config_path=args.bot_config,
     )
 
     ice_servers = args.ice_server or [DEFAULT_ICE_SERVER]

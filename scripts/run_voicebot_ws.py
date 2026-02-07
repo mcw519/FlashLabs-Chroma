@@ -17,6 +17,12 @@ def parse_args() -> argparse.Namespace:
         description="Run Chroma streaming voicebot WebSocket server"
     )
     parser.add_argument("--model-path", type=str, default=None)
+    parser.add_argument(
+        "--bot-config",
+        type=str,
+        default=None,
+        help="Path to bot config (.json/.toml) with system_prompt",
+    )
     parser.add_argument("--prompt-speaker", type=str, default="scarlett_johansson")
     parser.add_argument("--max-new-tokens", type=int, default=200)
     parser.add_argument("--max-text-new-tokens", type=int, default=64)
@@ -74,6 +80,7 @@ def main() -> None:
         enable_text=not args.disable_text,
         max_sessions=args.max_sessions,
         warmup=args.warmup,
+        bot_config_path=args.bot_config,
     )
 
     asr_transcriber = build_server_asr_transcriber(
