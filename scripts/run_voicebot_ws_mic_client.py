@@ -201,50 +201,6 @@ class _ColorFormatter(logging.Formatter):
             record.levelname = original_levelname
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Realtime microphone streaming client for Chroma voicebot WS server"
-    )
-    parser.add_argument("--url", type=str, default="ws://127.0.0.1:8765")
-    parser.add_argument("--session-id", type=str, default=None)
-
-    parser.add_argument("--speaker", type=str, default="scarlett_johansson")
-    parser.add_argument("--memory-turns", type=int, default=6)
-    parser.add_argument("--output-chunk-sec", type=float, default=0.5)
-    parser.add_argument(
-        "--text-mode",
-        type=str,
-        default="sentence",
-        choices=["none", "sentence", "final"],
-    )
-    parser.add_argument(
-        "--include-transcript-in-query",
-        action="store_true",
-        help="Include transcript text in the same-turn user query (text + audio)",
-    )
-
-    parser.add_argument("--chunk-ms", type=int, default=40)
-    parser.add_argument("--pre-roll-ms", type=int, default=200)
-    parser.add_argument("--min-speech-ms", type=int, default=280)
-    parser.add_argument("--pause-ms", type=int, default=500)
-    parser.add_argument("--vad-threshold", type=float, default=0.015)
-
-    parser.add_argument("--input-device", type=str, default=None)
-    parser.add_argument("--output-device", type=str, default=None)
-    parser.add_argument("--disable-playback", action="store_true")
-    parser.add_argument("--jitter-buffer-ms", type=int, default=300)
-    parser.add_argument(
-        "--crossfade-ms",
-        type=float,
-        default=8.0,
-        help=f"Chunk boundary crossfade duration (0-{int(MAX_CROSSFADE_MS)} ms)",
-    )
-    parser.add_argument("--no-device-prompt", action="store_true")
-    parser.add_argument("--no-color", action="store_true")
-    parser.add_argument("--log-level", type=str, default="INFO")
-    return parser.parse_args()
-
-
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -826,7 +782,129 @@ async def run_client(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    args = parse_args()
+    parser = argparse.ArgumentParser(
+        description="Realtime microphone streaming client for Chroma voicebot WS server"
+    )
+    parser.add_argument(
+        "--url",
+        type=str,
+        default="ws://127.0.0.1:8765",
+        help="WebSocket URL of the voicebot server",
+    )
+    parser.add_argument(
+        "--session-id",
+        type=str,
+        default=None,
+        help="Optional session_id to use for the connection (default: random)",
+    )
+
+    parser.add_argument(
+        "--speaker",
+        type=str,
+        default="scarlett_johansson",
+        help="Speaker/voice name to use for the assistant",
+        choices=["scarlett_johansson", "ariana_grande", "donald_trump", "lebron_james"],
+    )
+    parser.add_argument(
+        "--memory-turns",
+        type=int,
+        default=6,
+        help="Number of recent turns to include in context memory. (text only)",
+    )
+    parser.add_argument(
+        "--output-chunk-sec",
+        type=float,
+        default=1.0,
+        help="Duration of each output audio chunk in seconds. Lower values can reduce latency but increase risk of underflows.",
+    )
+    parser.add_argument(
+        "--text-mode",
+        type=str,
+        default="sentence",
+        choices=["none", "sentence", "final"],
+        help="When to send partial transcript text from the current turn. 'sentence' sends completed sentences, 'final' sends only the final transcript at the end of the turn, and 'none' disables transcript updates.",
+    )
+    parser.add_argument(
+        "--include-transcript-in-query",
+        action="store_true",
+        help="Include transcript text in the same-turn user query (text + audio)",
+    )
+
+    parser.add_argument(
+        "--chunk-ms",
+        type=int,
+        default=40,
+        help="Duration of each microphone audio chunk in milliseconds",
+    )
+    parser.add_argument(
+        "--pre-roll-ms",
+        type=int,
+        default=200,
+        help="Amount of audio to pre-roll before VAD trigger, in milliseconds",
+    )
+    parser.add_argument(
+        "--min-speech-ms",
+        type=int,
+        default=280,
+        help="Minimum duration of speech to consider a valid utterance, in milliseconds",
+    )
+    parser.add_argument(
+        "--pause-ms",
+        type=int,
+        default=500,
+        help="Duration of silence to consider the end of an utterance, in milliseconds",
+    )
+    parser.add_argument(
+        "--vad-threshold",
+        type=float,
+        default=0.015,
+        help="Voice activity detection threshold",
+    )
+
+    parser.add_argument(
+        "--input-device",
+        type=str,
+        default=None,
+        help="Audio input device index or name (default: system default)",
+    )
+    parser.add_argument(
+        "--output-device",
+        type=str,
+        default=None,
+        help="Audio output device index or name (default: system default)",
+    )
+    parser.add_argument(
+        "--disable-playback", action="store_true", help="Disable audio playback"
+    )
+    parser.add_argument(
+        "--jitter-buffer-ms",
+        type=int,
+        default=300,
+        help="Jitter buffer duration in milliseconds",
+    )
+    parser.add_argument(
+        "--crossfade-ms",
+        type=float,
+        default=8.0,
+        help=f"Chunk boundary crossfade duration (0-{int(MAX_CROSSFADE_MS)} ms)",
+    )
+    parser.add_argument(
+        "--no-device-prompt",
+        action="store_true",
+        help="Disable interactive audio device selection prompt on startup",
+    )
+    parser.add_argument(
+        "--no-color", action="store_true", help="Disable colored output"
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        help="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)",
+    )
+
+    args = parser.parse_args()
+
     use_color = _should_use_color(args.no_color)
     _configure_logging(args.log_level, use_color)
     _interactive_device_setup(args, use_color)
