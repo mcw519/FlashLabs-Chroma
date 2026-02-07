@@ -20,6 +20,8 @@ from transformers import AutoModelForCausalLM, AutoProcessor
 from transformers.generation.stopping_criteria import StoppingCriteria, StoppingCriteriaList
 from transformers.generation.streamers import BaseStreamer
 
+from chroma.pretrained import DEFAULT_CHROMA_MODEL_ID, resolve_model_id_and_cache_dir
+
 from .bot_config import load_bot_config
 from .types import (
     EngineEvent,
@@ -1163,35 +1165,6 @@ class StreamingVoicebotEngine:
         logger.debug("session lookup hit session_id=%s", session_id)
         return state
 
-    def _resolve_local_model_path(self, local_path: str) -> str:
-        logger.debug("resolve_local_model_path input=%s", local_path)
-        path = Path(local_path)
-        if (path / "config.json").is_file():
-            logger.debug("resolve_local_model_path direct config.json found")
-            return str(path)
-
-        snapshots_dir = path / "snapshots"
-        if snapshots_dir.is_dir():
-            ref_path = path / "refs" / "main"
-            if ref_path.is_file():
-                snapshot = snapshots_dir / ref_path.read_text().strip()
-                if (snapshot / "config.json").is_file():
-                    logger.debug("resolve_local_model_path resolved via refs/main")
-                    return str(snapshot)
-
-            snapshot_dirs = [p for p in snapshots_dir.iterdir() if p.is_dir()]
-            if len(snapshot_dirs) == 1 and (snapshot_dirs[0] / "config.json").is_file():
-                logger.debug("resolve_local_model_path resolved via single snapshot")
-                return str(snapshot_dirs[0])
-
-            raise ValueError(
-                "Local model path looks like a Hugging Face cache; pass the snapshot "
-                "directory (e.g. .../snapshots/<hash>)."
-            )
-
-        logger.debug("resolve_local_model_path fallback=%s", path)
-        return str(path)
-
     def _load_chroma_model(
         self,
         from_local_path: str | None,
@@ -1203,17 +1176,11 @@ class StreamingVoicebotEngine:
             from_local_path,
             use_half_precision,
         )
-        model_id = (
-            self._resolve_local_model_path(from_local_path)
-            if from_local_path
-            else "FlashLabs/Chroma-4B"
+        model_id, cache_dir = resolve_model_id_and_cache_dir(
+            from_local_path,
+            default_model_id=DEFAULT_CHROMA_MODEL_ID,
         )
-
-        cache_dir = None
-        if not from_local_path:
-            repo_root = Path(__file__).resolve().parents[2]
-            cache_dir = repo_root / "pretrained_models"
-            cache_dir.mkdir(parents=True, exist_ok=True)
+        if cache_dir:
             logger.debug("load_chroma_model cache_dir=%s", cache_dir)
 
         torch_dtype = torch.float32
@@ -1231,7 +1198,7 @@ class StreamingVoicebotEngine:
             model_id,
             trust_remote_code=True,
             device_map="auto",
-            cache_dir=str(cache_dir) if cache_dir else None,
+            cache_dir=cache_dir,
             torch_dtype=torch_dtype,
         ).eval()
         logger.info("model loaded device=%s dtype=%s", model.device, model.dtype)
@@ -1239,7 +1206,7 @@ class StreamingVoicebotEngine:
         processor = AutoProcessor.from_pretrained(
             model_id,
             trust_remote_code=True,
-            cache_dir=str(cache_dir) if cache_dir else None,
+            cache_dir=cache_dir,
         )
         logger.info("processor loaded")
 

@@ -8,6 +8,8 @@ from typing import Protocol
 import numpy as np
 import torch
 
+from chroma.pretrained import get_pretrained_cache_dir
+
 logger = logging.getLogger(__name__)
 
 INPUT_SAMPLE_RATE = 16000
@@ -29,6 +31,7 @@ class TransformersASRTranscriber:
         self.config = config
         self._lock = threading.Lock()
         device, torch_dtype = self._resolve_device(config.device)
+        cache_dir = get_pretrained_cache_dir()
         try:
             from transformers import pipeline as hf_pipeline
         except Exception as exc:
@@ -36,16 +39,18 @@ class TransformersASRTranscriber:
                 "Server ASR requires 'transformers'. Install dependencies and retry."
             ) from exc
         logger.info(
-            "Initializing server ASR model=%s device=%s dtype=%s",
+            "Initializing server ASR model=%s device=%s dtype=%s cache_dir=%s",
             config.model_id,
             device,
             torch_dtype,
+            cache_dir,
         )
         self._pipeline = hf_pipeline(
             task="automatic-speech-recognition",
             model=config.model_id,
             device=device,
-            torch_dtype=torch_dtype,
+            dtype=torch_dtype,
+            model_kwargs={"cache_dir": str(cache_dir)},
         )
 
     def transcribe_pcm16_16k(self, pcm16_16k: bytes) -> str | None:
@@ -84,7 +89,6 @@ class TransformersASRTranscriber:
         if key == "cpu":
             return -1, torch.float32
         raise ValueError("Invalid ASR device; use one of: auto, cpu, cuda")
-
 
 def build_server_asr_transcriber(
     *,
