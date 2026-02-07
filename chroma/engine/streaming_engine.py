@@ -20,6 +20,7 @@ from transformers import AutoModelForCausalLM, AutoProcessor
 from transformers.generation.stopping_criteria import StoppingCriteria, StoppingCriteriaList
 from transformers.generation.streamers import BaseStreamer
 
+from .bot_config import load_bot_config
 from .types import (
     EngineEvent,
     ErrorEvent,
@@ -265,11 +266,14 @@ class StreamingVoicebotEngine:
         max_sessions: int = 3,
         max_input_seconds: float = 30.0,
         warmup: bool = False,
+        bot_config_path: str | None = None,
+        system_prompt: str | None = None,
     ) -> None:
         _configure_engine_logging()
         logger.debug(
             "engine init start model_path=%s half_precision=%s max_new_tokens=%s max_text_new_tokens=%s "
-            "temperature=%s top_p=%s output_chunk_sec=%s default_speaker=%s enable_text=%s max_sessions=%s max_input_seconds=%s warmup=%s",
+            "temperature=%s top_p=%s output_chunk_sec=%s default_speaker=%s enable_text=%s max_sessions=%s "
+            "max_input_seconds=%s warmup=%s bot_config_path=%s has_custom_system_prompt=%s",
             model_path,
             use_half_precision,
             max_new_tokens,
@@ -282,6 +286,8 @@ class StreamingVoicebotEngine:
             max_sessions,
             max_input_seconds,
             warmup,
+            bot_config_path,
+            system_prompt is not None,
         )
         self.model, self.processor = self._load_chroma_model(
             from_local_path=model_path,
@@ -301,6 +307,10 @@ class StreamingVoicebotEngine:
         self.enable_text = enable_text
         self.max_sessions = max_sessions
         self.max_input_bytes = int(max_input_seconds * INPUT_SAMPLE_RATE * 2)
+        self.system_prompt = self._resolve_system_prompt(
+            system_prompt=system_prompt,
+            bot_config_path=bot_config_path,
+        )
 
         self._sessions: dict[str, _SessionState] = {}
         self._sessions_lock = threading.Lock()
@@ -312,11 +322,32 @@ class StreamingVoicebotEngine:
         if warmup:
             self.warmup()
         logger.info(
-            "engine ready device=%s dtype=%s speaker=%s",
+            "engine ready device=%s dtype=%s speaker=%s system_prompt_chars=%s",
             self.device,
             self.model_dtype,
             self.default_speaker,
+            len(self.system_prompt),
         )
+
+    def _resolve_system_prompt(
+        self,
+        *,
+        system_prompt: str | None,
+        bot_config_path: str | None,
+    ) -> str:
+        if system_prompt is not None:
+            prompt = system_prompt.strip()
+            if not prompt:
+                raise ValueError("system_prompt must not be empty")
+            logger.info("Using system prompt from runtime parameter.")
+            return prompt
+
+        if bot_config_path:
+            config = load_bot_config(bot_config_path)
+            logger.info("Using system prompt from bot config: %s", bot_config_path)
+            return config.system_prompt
+
+        return SYSTEM_PROMPT
 
     def warmup(self) -> None:
         logger.debug("warmup start")
@@ -908,9 +939,9 @@ class StreamingVoicebotEngine:
             query_text=query_text,
             include_transcript_in_query=include_transcript_in_query,
         )
-        system_text = SYSTEM_PROMPT
+        system_text = self.system_prompt
         if memory_context:
-            system_text = f"{SYSTEM_PROMPT}\n\n{memory_context}"
+            system_text = f"{self.system_prompt}\n\n{memory_context}"
         user_content: list[dict[str, Any]] = []
         if include_transcript_in_query and query_text:
             user_content.append({"type": "text", "text": query_text})

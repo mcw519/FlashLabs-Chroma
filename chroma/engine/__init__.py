@@ -1,3 +1,4 @@
+from .bot_config import BotConfig, load_bot_config
 from .streaming_engine import (
     INPUT_SAMPLE_RATE,
     OUTPUT_SAMPLE_RATE,
@@ -23,6 +24,7 @@ __all__ = [
     "ErrorEvent",
     "INPUT_SAMPLE_RATE",
     "OUTPUT_SAMPLE_RATE",
+    "BotConfig",
     "PROMPT_SPEAKERS",
     "ResponseAudioDeltaEvent",
     "ResponseCancelledEvent",
@@ -33,5 +35,6 @@ __all__ = [
     "StreamingVoicebotEngine",
     "event_to_dict",
     "float32_to_pcm16le_bytes",
+    "load_bot_config",
     "pcm16le_bytes_to_float32_mono",
 ]
