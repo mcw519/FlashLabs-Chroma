@@ -16,6 +16,13 @@ from chroma.engine.types import ErrorEvent, SessionConfig, event_to_dict
 logger = logging.getLogger(__name__)
 
 
+class RequestError(ValueError):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 class AudioTranscriber(Protocol):
     def transcribe_pcm16_16k(self, pcm16_16k: bytes) -> str | None: ...
 
@@ -142,6 +149,16 @@ class VoicebotWebSocketServer:
                 except ConnectionClosed:
                     logger.info("WebSocket closed by client while handling event: %s", event_type)
                     break
+                except RequestError as exc:
+                    await self._send_error(
+                        websocket,
+                        ErrorEvent(
+                            session_id=request.get("session_id"),
+                            code=exc.code,
+                            message=exc.message,
+                        ),
+                        send_json=send_json,
+                    )
                 except Exception as exc:
                     logger.exception("Failed to handle event: %s", event_type)
                     await self._send_error(
@@ -175,47 +192,60 @@ class VoicebotWebSocketServer:
             output_chunk_sec=config_payload.get("output_chunk_sec", 0.24),
             text_mode=config_payload.get("text_mode", "sentence"),
             include_transcript_in_query=config_payload.get("include_transcript_in_query", False),
+            system_prompt=config_payload.get("system_prompt"),
         )
         self.engine.create_session(session_id, config)
         owned_sessions.add(session_id)
+        normalized = self.engine.get_session_config(session_id)
         return {
             "type": "session.started",
             "session_id": session_id,
             "config": {
-                "speaker": config.speaker,
-                "memory_turns": config.memory_turns,
-                "output_chunk_sec": config.output_chunk_sec,
-                "text_mode": config.text_mode,
-                "include_transcript_in_query": config.include_transcript_in_query,
+                "speaker": normalized.speaker,
+                "memory_turns": normalized.memory_turns,
+                "output_chunk_sec": normalized.output_chunk_sec,
+                "text_mode": normalized.text_mode,
+                "include_transcript_in_query": normalized.include_transcript_in_query,
+                "system_prompt": normalized.system_prompt,
             },
         }
 
     def _handle_session_update(self, request: dict[str, Any]) -> dict[str, Any]:
         session_id = self._require_session_id(request)
         updates = request.get("config") or {}
-        self.engine.update_session(
-            session_id,
-            speaker=updates.get("speaker"),
-            memory_turns=updates.get("memory_turns"),
-            output_chunk_sec=updates.get("output_chunk_sec"),
-            text_mode=updates.get("text_mode"),
-            include_transcript_in_query=updates.get("include_transcript_in_query"),
-        )
+        update_kwargs: dict[str, Any] = {
+            "speaker": updates.get("speaker"),
+            "memory_turns": updates.get("memory_turns"),
+            "output_chunk_sec": updates.get("output_chunk_sec"),
+            "text_mode": updates.get("text_mode"),
+            "include_transcript_in_query": updates.get("include_transcript_in_query"),
+        }
+        if "system_prompt" in updates:
+            update_kwargs["system_prompt"] = updates.get("system_prompt")
+        self.engine.update_session(session_id, **update_kwargs)
+        normalized = self.engine.get_session_config(session_id)
         return {
             "type": "session.updated",
             "session_id": session_id,
-            "config": updates,
+            "config": {
+                "speaker": normalized.speaker,
+                "memory_turns": normalized.memory_turns,
+                "output_chunk_sec": normalized.output_chunk_sec,
+                "text_mode": normalized.text_mode,
+                "include_transcript_in_query": normalized.include_transcript_in_query,
+                "system_prompt": normalized.system_prompt,
+            },
         }
 
     def _handle_audio_append(self, request: dict[str, Any]) -> dict[str, Any]:
         session_id = self._require_session_id(request)
         audio_b64 = request.get("audio_b64")
         if not isinstance(audio_b64, str) or not audio_b64:
-            raise ValueError("Field 'audio_b64' is required")
+            raise RequestError("invalid_audio_payload", "Field 'audio_b64' is required")
         try:
-            audio_bytes = base64.b64decode(audio_b64)
+            audio_bytes = base64.b64decode(audio_b64, validate=True)
         except Exception as exc:
-            raise ValueError("Invalid base64 in field 'audio_b64'") from exc
+            raise RequestError("invalid_base64", "Invalid base64 in field 'audio_b64'") from exc
 
         self.engine.append_audio(session_id, audio_bytes)
         return {

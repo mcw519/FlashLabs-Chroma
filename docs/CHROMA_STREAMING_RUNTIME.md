@@ -22,7 +22,7 @@
 - 用途：建立 session 與初始 config
 - 範例：
 ```json
-{"type":"session.start","session_id":"demo-1","config":{"speaker":"scarlett_johansson","memory_turns":6,"output_chunk_sec":0.5,"text_mode":"sentence","include_transcript_in_query":false}}
+{"type":"session.start","session_id":"demo-1","config":{"speaker":"scarlett_johansson","memory_turns":6,"output_chunk_sec":0.5,"text_mode":"sentence","include_transcript_in_query":false,"system_prompt":"You are a concise support bot."}}
 ```
 
 2. `audio.append`
@@ -217,7 +217,7 @@ Memory 只在兩個時機點被寫入：
   - 每條記憶轉成 `- User: ...` 或 `- Assistant: ...`
   （line 817-828）。
 - 若 memory 文字非空，會附加到啟動時選定的 system prompt 後方再送進 processor
-  （預設 `SYSTEM_PROMPT`，或由 `--bot-config` 載入）。
+  （優先序：`session.system_prompt` > `--bot-config` > 內建 `SYSTEM_PROMPT`）。
 
 ### 5.4 `memory_turns=0` 的行為
 

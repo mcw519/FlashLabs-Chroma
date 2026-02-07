@@ -77,6 +77,7 @@ def _clip_text(text: str | None, max_chars: int = 160) -> str:
 _ANSI_RESET = "\033[0m"
 _ANSI_QUERY = "\033[38;5;214m"
 _ANSI_HISTORY = "\033[38;5;45m"
+_UNSET = object()
 
 
 def _colorize(text: str, color: str) -> str:
@@ -405,6 +406,7 @@ class StreamingVoicebotEngine:
             output_chunk_sec = kwargs.get("output_chunk_sec")
             text_mode = kwargs.get("text_mode")
             include_transcript_in_query = kwargs.get("include_transcript_in_query")
+            system_prompt = kwargs.get("system_prompt", _UNSET)
             merged = SessionConfig(
                 speaker=config.speaker if speaker is None else speaker,
                 memory_turns=config.memory_turns if memory_turns is None else memory_turns,
@@ -417,9 +419,25 @@ class StreamingVoicebotEngine:
                     if include_transcript_in_query is None
                     else include_transcript_in_query
                 ),
+                system_prompt=(
+                    config.system_prompt if system_prompt is _UNSET else system_prompt
+                ),
             )
             state.config = self._normalize_config(merged)
             logger.debug("session config updated session_id=%s config=%s", session_id, state.config)
+
+    def get_session_config(self, session_id: str) -> SessionConfig:
+        state = self._get_session(session_id)
+        with state.lock:
+            config = state.config
+            return SessionConfig(
+                speaker=config.speaker,
+                memory_turns=config.memory_turns,
+                output_chunk_sec=config.output_chunk_sec,
+                text_mode=config.text_mode,
+                include_transcript_in_query=config.include_transcript_in_query,
+                system_prompt=config.system_prompt,
+            )
 
     def set_pending_user_text(self, session_id: str, text: str | None) -> None:
         state = self._get_session(session_id)
@@ -939,9 +957,10 @@ class StreamingVoicebotEngine:
             query_text=query_text,
             include_transcript_in_query=include_transcript_in_query,
         )
-        system_text = self.system_prompt
+        active_prompt = state.config.system_prompt or self.system_prompt
+        system_text = active_prompt
         if memory_context:
-            system_text = f"{self.system_prompt}\n\n{memory_context}"
+            system_text = f"{active_prompt}\n\n{memory_context}"
         user_content: list[dict[str, Any]] = []
         if include_transcript_in_query and query_text:
             user_content.append({"type": "text", "text": query_text})
@@ -1095,6 +1114,7 @@ class StreamingVoicebotEngine:
             config.include_transcript_in_query,
             default=False,
         )
+        system_prompt = self._normalize_session_prompt(config.system_prompt)
 
         normalized = SessionConfig(
             speaker=speaker,
@@ -1102,8 +1122,22 @@ class StreamingVoicebotEngine:
             output_chunk_sec=output_chunk_sec,
             text_mode=text_mode,
             include_transcript_in_query=include_transcript_in_query,
+            system_prompt=system_prompt,
         )
         logger.debug("normalize_config output=%s", normalized)
+        return normalized
+
+    @staticmethod
+    def _normalize_session_prompt(value: Any) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("system_prompt must be string or null")
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("system_prompt must not be empty")
+        if len(normalized) > 4000:
+            raise ValueError("system_prompt exceeds 4000 characters")
         return normalized
 
     @staticmethod
