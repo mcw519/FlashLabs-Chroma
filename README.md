@@ -198,7 +198,8 @@ uv sync
 # Launch the WebRTC UI
 python scripts/run_realtime_webrtc.py \
   --use-half-precision \
-  --prompt-speaker scarlett_johansson
+  --prompt-speaker scarlett_johansson \
+  --bot-config example/bot_configs/support_agent.toml
 ```
 
 Then open http://localhost:7860 and speak into the mic to receive audio replies.
@@ -227,9 +228,19 @@ Run the server:
 ```bash
 python scripts/run_voicebot_ws.py \
   --use-half-precision \
+  --bot-config example/bot_configs/support_agent.toml \
   --prompt-speaker scarlett_johansson \
   --host 0.0.0.0 \
   --port 8765
+```
+
+Bot config supports `.toml`/`.json` and can override the startup system prompt:
+
+```toml
+system_prompt = """
+You are Chroma, a bilingual customer support voice assistant.
+Keep answers concise and action-oriented.
+"""
 ```
 
 Enable server-side ASR (client does not need to send transcript):

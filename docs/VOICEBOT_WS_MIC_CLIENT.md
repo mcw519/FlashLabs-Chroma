@@ -19,6 +19,7 @@ This document explains how to run and use the streaming voicebot server with the
 ```bash
 python scripts/run_voicebot_ws.py \
   --use-half-precision \
+  --bot-config example/bot_configs/support_agent.toml \
   --prompt-speaker scarlett_johansson \
   --host 0.0.0.0 \
   --port 8765
@@ -27,6 +28,7 @@ python scripts/run_voicebot_ws.py \
 Common options:
 
 - `--model-path`: local model path (optional)
+- `--bot-config`: bot config path (`.json`/`.toml`) for startup `system_prompt`
 - `--max-new-tokens`: audio length control
 - `--max-text-new-tokens`: text output length
 - `--output-chunk-sec`: response chunk cadence (default: `0.24`)

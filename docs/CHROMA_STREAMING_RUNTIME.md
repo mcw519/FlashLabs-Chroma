@@ -216,14 +216,14 @@ Memory 只在兩個時機點被寫入：
   - 開頭固定 `"Recent conversation summary:"`
   - 每條記憶轉成 `- User: ...` 或 `- Assistant: ...`
   （line 817-828）。
-- 若 memory 文字非空，會附加到 `SYSTEM_PROMPT` 後方再送進 processor
-  （line 839-842）。
+- 若 memory 文字非空，會附加到啟動時選定的 system prompt 後方再送進 processor
+  （預設 `SYSTEM_PROMPT`，或由 `--bot-config` 載入）。
 
 ### 5.4 `memory_turns=0` 的行為
 
 - `_memory_context()` 會直接回傳空字串，不注入歷史（line 818-820）。
 - `_append_memory()` 會清空現有記憶並跳過新增（line 913-916）。
-- 等同關閉記憶功能：每回合只看當次音訊與固定 system prompt。
+- 等同關閉記憶功能：每回合只看當次音訊與固定（或 bot config 指定）system prompt。
 
 ### 5.5 一次完整回合中的 Memory 資料流
 
