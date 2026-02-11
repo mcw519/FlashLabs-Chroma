@@ -19,6 +19,15 @@ logger = logging.getLogger(__name__)
 _LOGGER_CONFIGURED = False
 
 
+def _clip_text(text: str | None, max_chars: int = 220) -> str:
+    if not text:
+        return ""
+    clipped = text.strip().replace("\n", " ")
+    if len(clipped) <= max_chars:
+        return clipped
+    return clipped[: max_chars - 3] + "..."
+
+
 class RequestError(ValueError):
     def __init__(self, code: str, message: str):
         super().__init__(message)
@@ -310,8 +319,18 @@ class VoicebotWebSocketServer:
                     session_id,
                     len(server_transcript),
                 )
+                logger.info(
+                    "user.input session_id=%s source=server_asr text=%s",
+                    session_id,
+                    _clip_text(server_transcript),
+                )
             elif self.asr_transcriber is None and transcript:
                 self.engine.set_pending_user_text(session_id, transcript)
+                logger.info(
+                    "user.input session_id=%s source=client text=%s",
+                    session_id,
+                    _clip_text(transcript),
+                )
             elif self.asr_transcriber is not None and transcript:
                 logger.debug(
                     "client transcript ignored because server ASR is enabled session_id=%s",
