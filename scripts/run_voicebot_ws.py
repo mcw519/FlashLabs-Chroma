@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to bot config (.json/.toml) with system_prompt",
     )
     parser.add_argument("--prompt-speaker", type=str, default="scarlett_johansson")
-    parser.add_argument("--max-new-tokens", type=int, default=200)
+    parser.add_argument("--max-new-tokens", type=int, default=100)
     parser.add_argument("--max-text-new-tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.9)

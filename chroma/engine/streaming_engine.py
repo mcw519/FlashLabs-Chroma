@@ -17,7 +17,10 @@ import torch
 import torchaudio
 from silero_vad import get_speech_timestamps, load_silero_vad
 from transformers import AutoModelForCausalLM, AutoProcessor
-from transformers.generation.stopping_criteria import StoppingCriteria, StoppingCriteriaList
+from transformers.generation.stopping_criteria import (
+    StoppingCriteria,
+    StoppingCriteriaList,
+)
 from transformers.generation.streamers import BaseStreamer
 
 from .bot_config import load_bot_config
@@ -83,11 +86,13 @@ _UNSET = object()
 def _colorize(text: str, color: str) -> str:
     return f"{color}{text}{_ANSI_RESET}"
 
+
 PROMPT_SPEAKERS = [
     "scarlett_johansson",
     "ariana_grande",
     "donald_trump",
     "lebron_james",
+    "ben_vyin",
 ]
 SYSTEM_PROMPT = (
     "You are Chroma, an advanced virtual human created by the FlashLabs. "
@@ -106,7 +111,9 @@ class AbortOnCancelCriteria(StoppingCriteria):
         super().__init__()
         self._cancel_event = cancel_event
 
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+    def __call__(
+        self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs
+    ) -> bool:
         return self._cancel_event.is_set()
 
 
@@ -160,7 +167,9 @@ class _EngineAudioStreamer(BaseStreamer):
             logger.debug("%sstreamer cancel flag observed in put()", self.log_prefix)
             raise GenerationCancelled("Generation cancelled")
         if self._closed:
-            logger.debug("%sstreamer ignored put() because streamer closed", self.log_prefix)
+            logger.debug(
+                "%sstreamer ignored put() because streamer closed", self.log_prefix
+            )
             return
         tokens = torch.as_tensor(value)
         logger.debug("%sstreamer put() token_shape=%s", self.log_prefix, _shape(tokens))
@@ -179,7 +188,9 @@ class _EngineAudioStreamer(BaseStreamer):
                 )
                 return
         if tokens.ndim != 1:
-            logger.debug("%sstreamer ignored tokens with ndim=%s", self.log_prefix, tokens.ndim)
+            logger.debug(
+                "%sstreamer ignored tokens with ndim=%s", self.log_prefix, tokens.ndim
+            )
             return
         if tokens.numel() != self.num_codebooks:
             logger.debug(
@@ -193,10 +204,14 @@ class _EngineAudioStreamer(BaseStreamer):
 
     def _put_frame(self, tokens: torch.Tensor) -> None:
         if self.cancel_event.is_set():
-            logger.debug("%sstreamer cancel flag observed in _put_frame()", self.log_prefix)
+            logger.debug(
+                "%sstreamer cancel flag observed in _put_frame()", self.log_prefix
+            )
             raise GenerationCancelled("Generation cancelled")
         if (tokens == self.eos_token_id).all():
-            logger.debug("%sstreamer EOS frame received; ending stream", self.log_prefix)
+            logger.debug(
+                "%sstreamer EOS frame received; ending stream", self.log_prefix
+            )
             self.end()
             return
         self._buffer.append(tokens)
@@ -228,7 +243,9 @@ class _EngineAudioStreamer(BaseStreamer):
         del self._buffer[:count]
         audio_np = self._decode_frames(frames)
         if audio_np.size == 0:
-            logger.debug("%sstreamer decoded empty audio chunk; skip emit", self.log_prefix)
+            logger.debug(
+                "%sstreamer decoded empty audio chunk; skip emit", self.log_prefix
+            )
             return
         logger.debug(
             "%sstreamer emit audio_chunk shape=%s samples=%s",
@@ -240,7 +257,9 @@ class _EngineAudioStreamer(BaseStreamer):
 
     @torch.no_grad()
     def _decode_frames(self, frames: list[torch.Tensor]) -> np.ndarray:
-        logger.debug("%sstreamer decode_frames frame_count=%s", self.log_prefix, len(frames))
+        logger.debug(
+            "%sstreamer decode_frames frame_count=%s", self.log_prefix, len(frames)
+        )
         audio_codes = torch.stack(frames).to(self.model.device)
         audio_values = self.model.codec_model.decode(
             audio_codes.transpose(0, 1).unsqueeze(0)
@@ -271,7 +290,7 @@ class StreamingVoicebotEngine:
         system_prompt: str | None = None,
     ) -> None:
         _configure_engine_logging()
-        logger.debug(
+        logger.info(
             "engine init start model_path=%s half_precision=%s max_new_tokens=%s max_text_new_tokens=%s "
             "temperature=%s top_p=%s output_chunk_sec=%s default_speaker=%s enable_text=%s max_sessions=%s "
             "max_input_seconds=%s warmup=%s bot_config_path=%s has_custom_system_prompt=%s",
@@ -303,7 +322,9 @@ class StreamingVoicebotEngine:
         self.top_p = top_p
         self.default_output_chunk_sec = output_chunk_sec
         self.default_speaker = (
-            default_speaker if default_speaker in PROMPT_SPEAKERS else PROMPT_SPEAKERS[0]
+            default_speaker
+            if default_speaker in PROMPT_SPEAKERS
+            else PROMPT_SPEAKERS[0]
         )
         self.enable_text = enable_text
         self.max_sessions = max_sessions
@@ -353,7 +374,9 @@ class StreamingVoicebotEngine:
     def warmup(self) -> None:
         logger.debug("warmup start")
         audio = np.zeros(INPUT_SAMPLE_RATE, dtype=np.float32)
-        config = SessionConfig(speaker=self.default_speaker, output_chunk_sec=0.2, text_mode="none")
+        config = SessionConfig(
+            speaker=self.default_speaker, output_chunk_sec=0.2, text_mode="none"
+        )
         self.create_session("__warmup__", config)
         self.append_audio("__warmup__", float32_to_pcm16le_bytes(audio))
 
@@ -371,10 +394,15 @@ class StreamingVoicebotEngine:
             logger.debug("warmup end")
 
     def create_session(self, session_id: str, config: SessionConfig) -> None:
-        logger.debug("create_session session_id=%s requested_config=%s", session_id, config)
+        logger.debug(
+            "create_session session_id=%s requested_config=%s", session_id, config
+        )
         config = self._normalize_config(config)
         with self._sessions_lock:
-            if session_id not in self._sessions and len(self._sessions) >= self.max_sessions:
+            if (
+                session_id not in self._sessions
+                and len(self._sessions) >= self.max_sessions
+            ):
                 logger.error(
                     "create_session rejected session_id=%s active_sessions=%s max_sessions=%s",
                     session_id,
@@ -394,7 +422,11 @@ class StreamingVoicebotEngine:
                 return
         with state.lock:
             state.config = config
-        logger.debug("session updated via create_session session_id=%s config=%s", session_id, config)
+        logger.debug(
+            "session updated via create_session session_id=%s config=%s",
+            session_id,
+            config,
+        )
 
     def update_session(self, session_id: str, **kwargs: Any) -> None:
         logger.debug("update_session session_id=%s kwargs=%s", session_id, kwargs)
@@ -409,7 +441,9 @@ class StreamingVoicebotEngine:
             system_prompt = kwargs.get("system_prompt", _UNSET)
             merged = SessionConfig(
                 speaker=config.speaker if speaker is None else speaker,
-                memory_turns=config.memory_turns if memory_turns is None else memory_turns,
+                memory_turns=config.memory_turns
+                if memory_turns is None
+                else memory_turns,
                 output_chunk_sec=config.output_chunk_sec
                 if output_chunk_sec is None
                 else output_chunk_sec,
@@ -424,7 +458,11 @@ class StreamingVoicebotEngine:
                 ),
             )
             state.config = self._normalize_config(merged)
-            logger.debug("session config updated session_id=%s config=%s", session_id, state.config)
+            logger.debug(
+                "session config updated session_id=%s config=%s",
+                session_id,
+                state.config,
+            )
 
     def get_session_config(self, session_id: str) -> SessionConfig:
         state = self._get_session(session_id)
@@ -453,7 +491,9 @@ class StreamingVoicebotEngine:
     def append_audio(self, session_id: str, pcm16_16k: bytes) -> None:
         state = self._get_session(session_id)
         if not isinstance(pcm16_16k, (bytes, bytearray)):
-            logger.error("append_audio invalid payload type=%s", type(pcm16_16k).__name__)
+            logger.error(
+                "append_audio invalid payload type=%s", type(pcm16_16k).__name__
+            )
             raise TypeError("pcm16_16k must be bytes")
         with state.lock:
             prev_size = len(state.audio_buffer)
@@ -517,8 +557,12 @@ class StreamingVoicebotEngine:
         try:
             state = self._get_session(session_id)
         except ValueError as exc:
-            logger.error("commit_turn session not found session_id=%s error=%s", session_id, exc)
-            yield ErrorEvent(session_id=session_id, code="session_not_found", message=str(exc))
+            logger.error(
+                "commit_turn session not found session_id=%s error=%s", session_id, exc
+            )
+            yield ErrorEvent(
+                session_id=session_id, code="session_not_found", message=str(exc)
+            )
             return
 
         with state.lock:
@@ -554,7 +598,9 @@ class StreamingVoicebotEngine:
             self._append_memory(state, "user", user_text)
 
         if not audio_bytes:
-            logger.warning("commit_turn empty audio session_id=%s turn_id=%s", session_id, turn_id)
+            logger.warning(
+                "commit_turn empty audio session_id=%s turn_id=%s", session_id, turn_id
+            )
             yield ErrorEvent(
                 session_id=session_id,
                 code="empty_audio",
@@ -593,7 +639,10 @@ class StreamingVoicebotEngine:
                 session_id=session_id,
                 code="audio_too_short",
                 message="Audio segment too short after VAD",
-                details={"raw_seconds": raw_seconds, "trimmed_seconds": trimmed_seconds},
+                details={
+                    "raw_seconds": raw_seconds,
+                    "trimmed_seconds": trimmed_seconds,
+                },
             )
             self._clear_active_turn(state, turn_id)
             return
@@ -633,7 +682,9 @@ class StreamingVoicebotEngine:
 
         started_at = time.perf_counter()
         frame_rate = float(getattr(self.model.config.codec_config, "frame_rate", 12.5))
-        num_codebooks = int(getattr(self.model.config.decoder_config, "audio_num_codebooks", 1))
+        num_codebooks = int(
+            getattr(self.model.config.decoder_config, "audio_num_codebooks", 1)
+        )
         if num_codebooks <= 0:
             num_codebooks = 1
         metrics: dict[str, float] = {
@@ -689,7 +740,7 @@ class StreamingVoicebotEngine:
                     0.0, (time.perf_counter() - cancel_requested_at) * 1000.0
                 )
             logger.info(
-                "response complete session_id=%s turn_id=%s cancelled=%s text=\"%s\" metrics=%s",
+                'response complete session_id=%s turn_id=%s cancelled=%s text="%s" metrics=%s',
                 session_id,
                 turn_id,
                 cancelled,
@@ -784,7 +835,9 @@ class StreamingVoicebotEngine:
                 log_prefix=f"[{session_id}:{turn_id}] ",
             )
             try:
-                logger.debug("model.generate begin session_id=%s turn_id=%s", session_id, turn_id)
+                logger.debug(
+                    "model.generate begin session_id=%s turn_id=%s", session_id, turn_id
+                )
                 self.model.generate(
                     **inputs,
                     max_new_tokens=self.max_new_tokens,
@@ -793,12 +846,20 @@ class StreamingVoicebotEngine:
                     top_p=self.top_p,
                     use_cache=True,
                     streamer=streamer,
-                    stopping_criteria=StoppingCriteriaList([AbortOnCancelCriteria(cancel_event)]),
+                    stopping_criteria=StoppingCriteriaList(
+                        [AbortOnCancelCriteria(cancel_event)]
+                    ),
                 )
-                logger.debug("model.generate end session_id=%s turn_id=%s", session_id, turn_id)
+                logger.debug(
+                    "model.generate end session_id=%s turn_id=%s", session_id, turn_id
+                )
                 streamer.end()
                 if cancel_event.is_set():
-                    logger.info("generation cancelled session_id=%s turn_id=%s", session_id, turn_id)
+                    logger.info(
+                        "generation cancelled session_id=%s turn_id=%s",
+                        session_id,
+                        turn_id,
+                    )
                     finalize(cancelled=True)
                     return
 
@@ -807,7 +868,11 @@ class StreamingVoicebotEngine:
                     self._append_memory(state, "assistant", text_output)
                 finalize(cancelled=False, text_output=text_output)
             except GenerationCancelled:
-                logger.info("generation aborted by cancel event session_id=%s turn_id=%s", session_id, turn_id)
+                logger.info(
+                    "generation aborted by cancel event session_id=%s turn_id=%s",
+                    session_id,
+                    turn_id,
+                )
                 finalize(cancelled=True)
             except Exception as exc:
                 logger.exception("Generation failed")
@@ -821,7 +886,11 @@ class StreamingVoicebotEngine:
                 loop.call_soon_threadsafe(event_queue.put_nowait, None)
             finally:
                 self._clear_active_turn(state, turn_id)
-                logger.debug("generation thread cleanup done session_id=%s turn_id=%s", session_id, turn_id)
+                logger.debug(
+                    "generation thread cleanup done session_id=%s turn_id=%s",
+                    session_id,
+                    turn_id,
+                )
 
         worker = threading.Thread(target=run_generation, daemon=True)
         with state.lock:
@@ -829,12 +898,18 @@ class StreamingVoicebotEngine:
         emit(ResponseStartedEvent(session_id=session_id, turn_id=turn_id))
         logger.info("response started session_id=%s turn_id=%s", session_id, turn_id)
         worker.start()
-        logger.debug("generation thread started session_id=%s turn_id=%s", session_id, turn_id)
+        logger.debug(
+            "generation thread started session_id=%s turn_id=%s", session_id, turn_id
+        )
 
         while True:
             event = await event_queue.get()
             if event is None:
-                logger.debug("commit_turn end-of-stream marker session_id=%s turn_id=%s", session_id, turn_id)
+                logger.debug(
+                    "commit_turn end-of-stream marker session_id=%s turn_id=%s",
+                    session_id,
+                    turn_id,
+                )
                 break
             logger.debug(
                 "commit_turn yielding event session_id=%s turn_id=%s event_type=%s",
@@ -857,7 +932,9 @@ class StreamingVoicebotEngine:
             try:
                 asyncio.run(_run())
             except Exception as exc:
-                logger.exception("commit_turn_sync runner failed session_id=%s", session_id)
+                logger.exception(
+                    "commit_turn_sync runner failed session_id=%s", session_id
+                )
                 output_queue.put(
                     ErrorEvent(
                         session_id=session_id,
@@ -867,7 +944,9 @@ class StreamingVoicebotEngine:
                 )
             finally:
                 output_queue.put(None)
-                logger.debug("commit_turn_sync runner finished session_id=%s", session_id)
+                logger.debug(
+                    "commit_turn_sync runner finished session_id=%s", session_id
+                )
 
         threading.Thread(target=_runner, daemon=True).start()
 
@@ -909,7 +988,9 @@ class StreamingVoicebotEngine:
         repo_root = Path(__file__).resolve().parents[2]
         text_path = repo_root / "example" / "prompt_text" / f"{speaker}.txt"
         audio_path = repo_root / "example" / "prompt_audio" / f"{speaker}.wav"
-        logger.debug("loading prompt speaker=%s text=%s audio=%s", speaker, text_path, audio_path)
+        logger.debug(
+            "loading prompt speaker=%s text=%s audio=%s", speaker, text_path, audio_path
+        )
         prompt_text = text_path.read_text(encoding="utf-8")
         payload = ([prompt_text], [str(audio_path)])
         self._prompt_cache[speaker] = payload
@@ -918,7 +999,11 @@ class StreamingVoicebotEngine:
     def _move_to_device(self, value):
         if torch.is_tensor(value):
             if value.is_floating_point():
-                logger.debug("move tensor float to device shape=%s dtype=%s", _shape(value), self.model_dtype)
+                logger.debug(
+                    "move tensor float to device shape=%s dtype=%s",
+                    _shape(value),
+                    self.model_dtype,
+                )
                 return value.to(device=self.device, dtype=self.model_dtype)
             logger.debug("move tensor int/bool to device shape=%s", _shape(value))
             return value.to(device=self.device)
@@ -930,11 +1015,15 @@ class StreamingVoicebotEngine:
             return ""
         max_entries = max(1, state.config.memory_turns * 2)
         clipped = state.memory[-max_entries:]
-        logger.debug("memory context build entries=%s max_entries=%s", len(clipped), max_entries)
-        lines = ["Recent conversation summary:"]
+        logger.debug(
+            "memory context build entries=%s max_entries=%s", len(clipped), max_entries
+        )
+        # lines = ["Recent conversation summary:"]
+        lines = []
         for item in clipped:
             role = "User" if item.role == "user" else "Assistant"
-            lines.append(f"- {role}: {item.text}")
+            # lines.append(f"- {role}: {item.text}")
+            lines.append(f"{role}: {item.text}")
         return "\n".join(lines)
 
     def _prepare_inputs(
@@ -947,7 +1036,9 @@ class StreamingVoicebotEngine:
         query_text: str | None,
         include_transcript_in_query: bool,
     ) -> dict[str, torch.Tensor]:
-        logger.debug("prepare_inputs start speaker=%s audio_shape=%s", speaker, _shape(audio_np))
+        logger.debug(
+            "prepare_inputs start speaker=%s audio_shape=%s", speaker, _shape(audio_np)
+        )
         prompt_text, prompt_audio = self._load_prompt(speaker)
         memory_context = self._memory_context(state)
         self._log_input_context(
@@ -961,6 +1052,8 @@ class StreamingVoicebotEngine:
         system_text = active_prompt
         if memory_context:
             system_text = f"{active_prompt}\n\n{memory_context}"
+
+        # User content includes optional transcript followed by audio; system content includes system prompt and memory context.
         user_content: list[dict[str, Any]] = []
         if include_transcript_in_query and query_text:
             user_content.append({"type": "text", "text": query_text})
@@ -974,6 +1067,7 @@ class StreamingVoicebotEngine:
                 {"role": "user", "content": user_content},
             ]
         ]
+        logger.info(_colorize(f"[THINKER's text input]\n {system_text}", _ANSI_QUERY))
         inputs = self.processor(
             conversation,
             add_generation_prompt=True,
@@ -1022,8 +1116,12 @@ class StreamingVoicebotEngine:
         )
 
     @torch.no_grad()
-    def _generate_text(self, inputs: dict[str, torch.Tensor], text_mode: str) -> str | None:
-        logger.debug("generate_text start enabled=%s text_mode=%s", self.enable_text, text_mode)
+    def _generate_text(
+        self, inputs: dict[str, torch.Tensor], text_mode: str
+    ) -> str | None:
+        logger.debug(
+            "generate_text start enabled=%s text_mode=%s", self.enable_text, text_mode
+        )
         if not self.enable_text or text_mode == "none":
             logger.debug("generate_text skipped by config")
             return None
@@ -1048,10 +1146,13 @@ class StreamingVoicebotEngine:
         if generated_ids.numel() == 0:
             logger.debug("generate_text empty generated ids")
             return None
-        text = self.processor.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        text = self.processor.tokenizer.decode(
+            generated_ids, skip_special_tokens=True
+        ).strip()
         if not text:
             logger.debug("generate_text decoded empty text")
             return None
+        logger.info(_colorize(f"[THINKER's output] {_clip_text(text)}", _ANSI_QUERY))
         if text_mode == "final":
             logger.debug("generate_text final mode length=%s", len(text))
             return text
@@ -1226,7 +1327,9 @@ class StreamingVoicebotEngine:
                     "Half precision requested but CUDA is unavailable; using fp32."
                 )
 
-        logger.info("load_chroma_model loading model_id=%s dtype=%s", model_id, torch_dtype)
+        logger.info(
+            "load_chroma_model loading model_id=%s dtype=%s", model_id, torch_dtype
+        )
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             trust_remote_code=True,
@@ -1264,7 +1367,9 @@ def _normalize_audio(audio: np.ndarray) -> np.ndarray:
     return audio.astype(np.float32, copy=False)
 
 
-def _resample_audio(audio: np.ndarray, sample_rate: int, target_sample_rate: int) -> np.ndarray:
+def _resample_audio(
+    audio: np.ndarray, sample_rate: int, target_sample_rate: int
+) -> np.ndarray:
     audio = _normalize_audio(audio)
     if sample_rate == target_sample_rate:
         return audio

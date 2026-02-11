@@ -21,7 +21,7 @@ from typing import Any
 import numpy as np
 
 try:
-    import sounddevice as sd
+    import sounddevice as sd  # type: ignore
 except Exception as exc:  # pragma: no cover
     raise SystemExit(
         "Missing dependency: sounddevice. Install with `python -m pip install sounddevice`."
@@ -803,7 +803,13 @@ def main() -> None:
         type=str,
         default="scarlett_johansson",
         help="Speaker/voice name to use for the assistant",
-        choices=["scarlett_johansson", "ariana_grande", "donald_trump", "lebron_james"],
+        choices=[
+            "scarlett_johansson",
+            "ariana_grande",
+            "donald_trump",
+            "lebron_james",
+            "ben_vyin",
+        ],
     )
     parser.add_argument(
         "--memory-turns",
