@@ -83,6 +83,30 @@ uv sync
 
 ```
 
+### Pre-download Models (Unified Script)
+
+Download all required pretrained models into one unified cache directory: `pretrained_models/`.
+
+```bash
+uv run python scripts/download_pretrained_models.py
+```
+
+By default, this downloads:
+- `FlashLabs/Chroma-4B`
+- `openai/whisper-small`
+
+Optional flags:
+```bash
+# Custom model IDs
+uv run python scripts/download_pretrained_models.py \
+  --chroma-model FlashLabs/Chroma-4B \
+  --whisper-model openai/whisper-small
+
+# Download only one model
+uv run python scripts/download_pretrained_models.py --skip-whisper
+uv run python scripts/download_pretrained_models.py --skip-chroma
+```
+
 ### Loading the Model
 
 ```python

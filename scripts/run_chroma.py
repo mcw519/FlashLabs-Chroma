@@ -4,13 +4,14 @@
 import argparse
 import logging
 import time
-from pathlib import Path
 from typing import Optional
 
 import colorlog
 import torch
 import torchaudio
 from transformers import AutoModelForCausalLM, AutoProcessor
+
+from chroma.pretrained import DEFAULT_CHROMA_MODEL_ID, resolve_model_id_and_cache_dir
 
 
 def _configure_logging() -> None:
@@ -27,45 +28,13 @@ def _configure_logging() -> None:
 _configure_logging()
 
 
-def _resolve_local_model_path(local_path: str) -> str:
-    path = Path(local_path)
-    if (path / "config.json").is_file():
-        return str(path)
-
-    snapshots_dir = path / "snapshots"
-    if snapshots_dir.is_dir():
-        ref_path = path / "refs" / "main"
-        if ref_path.is_file():
-            snapshot = snapshots_dir / ref_path.read_text().strip()
-            if (snapshot / "config.json").is_file():
-                return str(snapshot)
-
-        snapshot_dirs = [p for p in snapshots_dir.iterdir() if p.is_dir()]
-        if len(snapshot_dirs) == 1 and (snapshot_dirs[0] / "config.json").is_file():
-            return str(snapshot_dirs[0])
-
-        raise ValueError(
-            "Local model path looks like a Hugging Face cache; pass the snapshot "
-            "directory (e.g. .../snapshots/<hash>)."
-        )
-
-    return str(path)
-
-
 def load_chroma_model(
     from_local_path: Optional[str] = None, *, use_half_precision: bool = True
 ):
-    model_id = (
-        _resolve_local_model_path(from_local_path)
-        if from_local_path
-        else "FlashLabs/Chroma-4B"
+    model_id, cache_dir = resolve_model_id_and_cache_dir(
+        from_local_path,
+        default_model_id=DEFAULT_CHROMA_MODEL_ID,
     )
-
-    cache_dir = None
-    if not from_local_path:
-        repo_root = Path(__file__).resolve().parents[1]
-        cache_dir = repo_root / "pretrained_models"
-        cache_dir.mkdir(parents=True, exist_ok=True)
 
     torch_dtype = torch.float32
     if use_half_precision:
@@ -81,7 +50,7 @@ def load_chroma_model(
         model_id,
         trust_remote_code=True,
         device_map="auto",
-        cache_dir=str(cache_dir) if cache_dir else None,
+        cache_dir=cache_dir,
         torch_dtype=torch_dtype,
     ).eval()
 
@@ -89,7 +58,7 @@ def load_chroma_model(
     processor = AutoProcessor.from_pretrained(
         model_id,
         trust_remote_code=True,
-        cache_dir=str(cache_dir) if cache_dir else None,
+        cache_dir=cache_dir,
     )
 
     return model, processor
