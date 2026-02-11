@@ -90,12 +90,17 @@ class ChromaGenerationMixin(GenerationMixin):
 
         kept_criteria = StoppingCriteriaList()
         for criterion in criteria:
-            if not isinstance(criterion, MaxLengthCriteria):
-                logger.warning(
-                    f"Chroma does not support {criterion.__class__.__name__} stopping criteria, it will be ignored."
-                )
-            else:
+            if isinstance(criterion, MaxLengthCriteria):
                 kept_criteria.append(criterion)
+                continue
+            module_name = criterion.__class__.__module__
+            if module_name.startswith("transformers."):
+                logger.warning(
+                    "Chroma does not support %s stopping criteria from transformers; it will be ignored.",
+                    criterion.__class__.__name__,
+                )
+                continue
+            kept_criteria.append(criterion)
         return kept_criteria
 
     def _prepare_generation_config(

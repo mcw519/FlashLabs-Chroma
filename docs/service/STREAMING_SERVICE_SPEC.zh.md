@@ -47,7 +47,7 @@ V2 為**破壞性升級**，已取代舊事件命名。
 
 ## 5. Turn 主導權
 - `turn_detection.mode=client_commit`：由 client 發 `input.turn.commit`，server 不自動切 turn。
-- `turn_detection.mode=server_vad`：由 server 透過 Silero VAD 自動 commit。
+- `turn_detection.mode=server_vad`：由 server 透過 Silero `VADIterator`（增量串流模式）自動 commit。
 
 ## 6. Client -> Server 事件
 1. `session.open`
@@ -104,3 +104,53 @@ V2 為**破壞性升級**，已取代舊事件命名。
 - `invalid_base64`
 - `request_failed`
 - `audio_commit_failed`
+
+## 10. V1 -> V2 升級指南（Breaking）
+
+本次升級為 V2-only，不提供 V1 adapter。  
+若 client 仍使用 V1 事件名，server 會回 `unknown_type`。
+
+### 10.1 事件名稱對照
+
+| V1 | V2 | 說明 |
+| --- | --- | --- |
+| `session.start` | `session.open` | 建立 session。 |
+| `session.started` | `session.opened` | 建立成功事件。 |
+| `audio.append` | `input.audio.append` | 上傳音訊 chunk。 |
+| `audio.appended` | `input.audio.accepted` | server 確認收音訊。 |
+| `audio.commit` | `input.turn.commit` | 提交 turn 觸發推論。 |
+| `response.stream.started` | `response.stream.opened` | 推論串流開始事件。 |
+| `response.cancel` | `response.cancel` | 事件名不變，但回覆行為改變。 |
+| `session.end` | `session.close` | 關閉 session。 |
+| `session.ended` | `session.closed` | 關閉完成事件。 |
+| `session.update` | `session.update` | 事件名不變。 |
+
+### 10.2 Session Config 參數映射
+
+| V1 欄位 | V2 欄位 | 映射規則 |
+| --- | --- | --- |
+| `auto_commit` | `turn_detection.mode` | `true -> server_vad`；`false -> client_commit`。 |
+| `vad_threshold` | `turn_detection.threshold` | 直接對應。 |
+| `vad_min_speech_ms` | `turn_detection.min_speech_ms` | 直接對應。 |
+| `vad_min_silence_ms` | `turn_detection.min_silence_ms` | 直接對應。 |
+| `vad_speech_pad_ms` | `turn_detection.speech_pad_ms` | 直接對應。 |
+
+注意：
+- V2 以 `turn_detection` 為唯一 turn 相關設定來源，不應再傳 V1 的扁平欄位。
+- V1 扁平欄位在 V2 schema 中不生效，等同 no-op，可能造成設定與預期不一致。
+
+### 10.3 重要行為差異
+
+1. `response.cancel` 不再有 `response.cancelled.requested` ack 事件。
+2. 取消成功時，仍會由推論事件流回 `response.cancelled`。
+3. turn 主導權只能二選一：
+   - `turn_detection.mode=client_commit`
+   - `turn_detection.mode=server_vad`
+4. `session.open` / `session.update` 回傳的 `config` 都是正規化後結果，可當作最終生效配置。
+
+### 10.4 升級檢查清單
+
+1. 將所有 V1 事件名替換為 V2 名稱（見 10.1）。
+2. 將 `auto_commit` + `vad_*` 扁平設定改為 `turn_detection` 物件（見 10.2）。
+3. 移除對 `response.cancelled.requested` 的依賴，改以 `response.cancelled` / `response.done` 判斷終態。
+4. 在 client 端固定選擇一種 turn 模式（`client_commit` 或 `server_vad`），不要混用雙邊切 turn。

@@ -77,3 +77,166 @@ def test_should_auto_commit_disabled_in_client_commit_mode() -> None:
     ready, reason, _, _ = engine.should_auto_commit("s1")
     assert ready is False
     assert reason == "mode_client_commit"
+
+
+def test_should_auto_commit_uses_incremental_vad_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _dummy_engine()
+    engine.max_input_bytes = 400000
+    engine._sessions_lock = threading.Lock()
+    engine._vad_model = object()
+    state = _SessionState(
+        config=SessionConfig(
+            turn_detection=TurnDetectionConfig(mode="server_vad"),
+        )
+    )
+    state.audio_buffer.extend(b"\x00\x00" * 64000)
+    engine._sessions = {"s1": state}
+    created_iterators = []
+
+    class _FakeVADIterator:
+        def __init__(
+            self,
+            model,
+            threshold: float,
+            sampling_rate: int,
+            min_silence_duration_ms: int,
+            speech_pad_ms: int,
+        ) -> None:
+            self.model = model
+            self.threshold = threshold
+            self.sampling_rate = sampling_rate
+            self.min_silence_duration_ms = min_silence_duration_ms
+            self.speech_pad_ms = speech_pad_ms
+            self.current_sample = 0
+            self.calls = 0
+            created_iterators.append(self)
+
+        def reset_states(self) -> None:
+            self.current_sample = 0
+
+        def __call__(self, x):
+            self.calls += 1
+            self.current_sample += int(x.numel())
+            return None
+
+    monkeypatch.setattr("chroma.engine.streaming_engine.VADIterator", _FakeVADIterator)
+
+    ready1, reason1, _, _ = engine.should_auto_commit("s1")
+    assert ready1 is False
+    assert reason1 == "no_speech"
+    assert len(created_iterators) == 1
+    first_calls = created_iterators[0].calls
+    assert first_calls == 125
+
+    engine.append_audio("s1", b"\x00\x00" * 1600)
+    ready2, reason2, _, _ = engine.should_auto_commit("s1")
+    assert ready2 is False
+    assert reason2 == "no_speech"
+    second_delta = created_iterators[0].calls - first_calls
+    assert second_delta == 3
+
+
+def test_should_auto_commit_skips_vad_when_no_new_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _dummy_engine()
+    engine.max_input_bytes = 400000
+    engine._sessions_lock = threading.Lock()
+    engine._vad_model = object()
+    state = _SessionState(
+        config=SessionConfig(
+            turn_detection=TurnDetectionConfig(mode="server_vad"),
+        )
+    )
+    state.audio_buffer.extend(b"\x00\x00" * 16000)
+    engine._sessions = {"s1": state}
+    created_iterators = []
+
+    class _FakeVADIterator:
+        def __init__(
+            self,
+            model,
+            threshold: float,
+            sampling_rate: int,
+            min_silence_duration_ms: int,
+            speech_pad_ms: int,
+        ) -> None:
+            self.model = model
+            self.threshold = threshold
+            self.sampling_rate = sampling_rate
+            self.min_silence_duration_ms = min_silence_duration_ms
+            self.speech_pad_ms = speech_pad_ms
+            self.current_sample = 0
+            self.calls = 0
+            created_iterators.append(self)
+
+        def reset_states(self) -> None:
+            self.current_sample = 0
+
+        def __call__(self, x):
+            self.calls += 1
+            self.current_sample += int(x.numel())
+            return None
+
+    monkeypatch.setattr("chroma.engine.streaming_engine.VADIterator", _FakeVADIterator)
+
+    ready1, _, _, _ = engine.should_auto_commit("s1")
+    assert len(created_iterators) == 1
+    first_calls = created_iterators[0].calls
+    ready2, _, _, _ = engine.should_auto_commit("s1")
+    assert ready1 is False
+    assert ready2 is False
+    assert created_iterators[0].calls == first_calls
+
+
+def test_should_auto_commit_enforces_min_speech_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _dummy_engine()
+    engine.max_input_bytes = 400000
+    engine._sessions_lock = threading.Lock()
+    engine._vad_model = object()
+    state = _SessionState(
+        config=SessionConfig(
+            turn_detection=TurnDetectionConfig(
+                mode="server_vad",
+                min_speech_ms=250,
+                min_silence_ms=200,
+            ),
+        )
+    )
+    state.audio_buffer.extend(b"\x00\x00" * 12000)
+    engine._sessions = {"s1": state}
+
+    class _FakeVADIterator:
+        def __init__(
+            self,
+            model,
+            threshold: float,
+            sampling_rate: int,
+            min_silence_duration_ms: int,
+            speech_pad_ms: int,
+        ) -> None:
+            self.current_sample = 0
+            self.calls = 0
+
+        def reset_states(self) -> None:
+            self.current_sample = 0
+            self.calls = 0
+
+        def __call__(self, x):
+            self.calls += 1
+            self.current_sample += int(x.numel())
+            if self.calls == 1:
+                return {"start": 0}
+            if self.calls == 2:
+                return {"end": 512}
+            return None
+
+    monkeypatch.setattr("chroma.engine.streaming_engine.VADIterator", _FakeVADIterator)
+
+    ready, reason, _, _ = engine.should_auto_commit("s1")
+    assert ready is False
+    assert reason == "speech_too_short"

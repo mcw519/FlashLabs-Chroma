@@ -47,7 +47,7 @@ V2 is **breaking** and replaces previous event names.
 
 ## 5. Turn Ownership
 - `turn_detection.mode=client_commit`: client sends `input.turn.commit`; server does not auto-commit.
-- `turn_detection.mode=server_vad`: server auto-commits based on Silero VAD.
+- `turn_detection.mode=server_vad`: server auto-commits with Silero `VADIterator` in incremental streaming mode.
 
 ## 6. Client -> Server Events
 1. `session.open`
@@ -104,3 +104,53 @@ V2 is **breaking** and replaces previous event names.
 - `invalid_base64`
 - `request_failed`
 - `audio_commit_failed`
+
+## 10. V1 -> V2 Migration Guide (Breaking)
+
+This upgrade is V2-only and does not provide a V1 adapter.  
+If a client still sends V1 event names, the server returns `unknown_type`.
+
+### 10.1 Event Name Mapping
+
+| V1 | V2 | Notes |
+| --- | --- | --- |
+| `session.start` | `session.open` | Create session. |
+| `session.started` | `session.opened` | Session created event. |
+| `audio.append` | `input.audio.append` | Upload audio chunk. |
+| `audio.appended` | `input.audio.accepted` | Server accepted audio chunk. |
+| `audio.commit` | `input.turn.commit` | Commit turn and trigger inference. |
+| `response.stream.started` | `response.stream.opened` | Stream-open marker before model events. |
+| `response.cancel` | `response.cancel` | Name unchanged, response behavior changed. |
+| `session.end` | `session.close` | Close session. |
+| `session.ended` | `session.closed` | Session closed event. |
+| `session.update` | `session.update` | Name unchanged. |
+
+### 10.2 Session Config Mapping
+
+| V1 Field | V2 Field | Mapping Rule |
+| --- | --- | --- |
+| `auto_commit` | `turn_detection.mode` | `true -> server_vad`; `false -> client_commit`. |
+| `vad_threshold` | `turn_detection.threshold` | Direct mapping. |
+| `vad_min_speech_ms` | `turn_detection.min_speech_ms` | Direct mapping. |
+| `vad_min_silence_ms` | `turn_detection.min_silence_ms` | Direct mapping. |
+| `vad_speech_pad_ms` | `turn_detection.speech_pad_ms` | Direct mapping. |
+
+Notes:
+- V2 uses `turn_detection` as the only source of turn-segmentation settings.
+- V1 flat fields are not applied by the V2 schema; keeping them becomes a silent no-op and can cause config drift.
+
+### 10.3 Behavioral Changes You Must Handle
+
+1. `response.cancel` no longer emits `response.cancelled.requested`.
+2. Successful cancellation is still surfaced by `response.cancelled` in the model event stream.
+3. Turn ownership is mutually exclusive:
+   - `turn_detection.mode=client_commit`
+   - `turn_detection.mode=server_vad`
+4. `session.open` / `session.update` return normalized `config`; treat this as the source of truth.
+
+### 10.4 Upgrade Checklist
+
+1. Rename all V1 events to V2 names (see 10.1).
+2. Replace flat `auto_commit` + `vad_*` fields with `turn_detection` object (see 10.2).
+3. Remove any dependency on `response.cancelled.requested`; use `response.cancelled` / `response.done` as terminal signals.
+4. Ensure client chooses exactly one turn mode (`client_commit` or `server_vad`) and does not mix dual-side turn segmentation.

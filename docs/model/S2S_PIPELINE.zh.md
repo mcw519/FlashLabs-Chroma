@@ -19,6 +19,7 @@
 
 ## 3. 串流單回合流程
 1. 透過 `input.audio.append` 累積 PCM16 16k mono 音訊
+  - 若 `turn_detection.mode=server_vad`，server 以 session 級 Silero `VADIterator` 增量掃描新 chunk 判定自動 commit。
 2. commit 後：
   - PCM16 -> float32
   - 可選 VAD trim（`trim_with_vad`）

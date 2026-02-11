@@ -19,6 +19,7 @@ Alignment points:
 
 ## 3. Streaming Turn Pipeline
 1. Buffer PCM16 16k mono via `input.audio.append`
+  - When `turn_detection.mode=server_vad`, server uses a session-scoped Silero `VADIterator` to incrementally evaluate new chunks for auto-commit.
 2. On commit:
   - decode PCM16 -> float32
   - optional VAD trim (`trim_with_vad`)

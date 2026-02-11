@@ -13,7 +13,7 @@ from typing import Any, AsyncIterator, Iterator
 import numpy as np
 import torch
 import torchaudio
-from silero_vad import get_speech_timestamps, load_silero_vad
+from silero_vad import VADIterator, get_speech_timestamps, load_silero_vad
 from transformers import AutoModelForCausalLM, AutoProcessor
 from transformers.generation.stopping_criteria import (
     StoppingCriteria,
@@ -85,6 +85,9 @@ SYSTEM_PROMPT = (
 )
 INPUT_SAMPLE_RATE = 16000
 OUTPUT_SAMPLE_RATE = 24000
+BYTES_PER_SAMPLE = 2
+VAD_ITERATOR_WINDOW_SAMPLES = 512
+VAD_ITERATOR_WINDOW_BYTES = VAD_ITERATOR_WINDOW_SAMPLES * BYTES_PER_SAMPLE
 
 
 class GenerationCancelled(RuntimeError):
@@ -120,6 +123,12 @@ class _SessionState:
     active_thread: threading.Thread | None = None
     cancel_requested_at: float | None = None
     pending_user_text: str | None = None
+    vad_iterator: VADIterator | None = None
+    vad_iterator_key: tuple[float, int, int] | None = None
+    vad_iterator_consumed_bytes: int = 0
+    vad_active_speech_start_sample: int | None = None
+    vad_last_speech_end_sample: int | None = None
+    vad_total_speech_samples: int = 0
 
 
 class _EngineAudioStreamer(BaseStreamer):
@@ -409,6 +418,7 @@ class StreamingVoicebotEngine:
                 return
         with state.lock:
             state.config = config
+            self._reset_vad_tracking_locked(state)
         logger.debug(
             "session updated via create_session session_id=%s config=%s",
             session_id,
@@ -421,6 +431,7 @@ class StreamingVoicebotEngine:
         normalized = self._normalize_config(config)
         with state.lock:
             state.config = normalized
+            self._reset_vad_tracking_locked(state)
             logger.debug(
                 "session config updated session_id=%s config=%s",
                 session_id,
@@ -472,6 +483,8 @@ class StreamingVoicebotEngine:
             overflow = len(state.audio_buffer) - self.max_input_bytes
             if overflow > 0:
                 del state.audio_buffer[:overflow]
+                # Buffer origin changed due to trim; reset streaming VAD cursor state.
+                self._reset_vad_tracking_locked(state)
                 logger.warning(
                     "append_audio overflow trimmed session_id=%s overflow_bytes=%s buffer_after=%s",
                     session_id,
@@ -492,44 +505,110 @@ class StreamingVoicebotEngine:
         with state.lock:
             return bytes(state.audio_buffer)
 
+    def _reset_vad_tracking_locked(self, state: _SessionState) -> None:
+        state.vad_iterator_consumed_bytes = 0
+        state.vad_active_speech_start_sample = None
+        state.vad_last_speech_end_sample = None
+        state.vad_total_speech_samples = 0
+        if state.vad_iterator is not None:
+            state.vad_iterator.reset_states()
+
+    def _ensure_vad_iterator_locked(
+        self, state: _SessionState, turn_detection: TurnDetectionConfig
+    ) -> VADIterator:
+        key = (
+            float(turn_detection.threshold),
+            int(turn_detection.min_silence_ms),
+            int(turn_detection.speech_pad_ms),
+        )
+        if state.vad_iterator is None or state.vad_iterator_key != key:
+            state.vad_iterator = VADIterator(
+                self._vad_model,
+                threshold=turn_detection.threshold,
+                sampling_rate=INPUT_SAMPLE_RATE,
+                min_silence_duration_ms=turn_detection.min_silence_ms,
+                speech_pad_ms=turn_detection.speech_pad_ms,
+            )
+            state.vad_iterator_key = key
+            state.vad_iterator_consumed_bytes = 0
+            state.vad_active_speech_start_sample = None
+            state.vad_last_speech_end_sample = None
+            state.vad_total_speech_samples = 0
+        return state.vad_iterator
+
     def should_auto_commit(self, session_id: str) -> tuple[bool, str, float, float]:
         state = self._get_session(session_id)
         with state.lock:
             config = self._normalize_config(state.config)
-            audio_bytes = bytes(state.audio_buffer)
-        turn_detection = config.turn_detection
+            turn_detection = config.turn_detection
 
-        if turn_detection.mode != "server_vad":
-            return False, "mode_client_commit", 0.0, 0.0
+            if turn_detection.mode != "server_vad":
+                return False, "mode_client_commit", 0.0, 0.0
 
-        if not audio_bytes:
-            return False, "empty", 0.0, 0.0
+            if not state.audio_buffer:
+                return False, "empty", 0.0, 0.0
 
-        buffered_samples = len(audio_bytes) // 2
-        buffered_sec = buffered_samples / float(INPUT_SAMPLE_RATE)
-        if len(audio_bytes) >= self.max_input_bytes:
-            return True, "max_buffer", 0.0, buffered_sec
+            buffered_samples = len(state.audio_buffer) // 2
+            buffered_sec = buffered_samples / float(INPUT_SAMPLE_RATE)
+            if len(state.audio_buffer) >= self.max_input_bytes:
+                return True, "max_buffer", 0.0, buffered_sec
 
-        audio_np = pcm16le_bytes_to_float32_mono(audio_bytes)
-        audio_tensor = torch.from_numpy(audio_np)
-        speech_timestamps = get_speech_timestamps(
-            audio_tensor,
-            self._vad_model,
-            sampling_rate=INPUT_SAMPLE_RATE,
-            threshold=turn_detection.threshold,
-            min_speech_duration_ms=turn_detection.min_speech_ms,
-            min_silence_duration_ms=turn_detection.min_silence_ms,
-            speech_pad_ms=turn_detection.speech_pad_ms,
-        )
-        if not speech_timestamps:
-            return False, "no_speech", 0.0, buffered_sec
+            if state.vad_iterator_consumed_bytes > len(state.audio_buffer):
+                self._reset_vad_tracking_locked(state)
+            iterator = self._ensure_vad_iterator_locked(state, turn_detection)
+            while (
+                state.vad_iterator_consumed_bytes + VAD_ITERATOR_WINDOW_BYTES
+                <= len(state.audio_buffer)
+            ):
+                start = state.vad_iterator_consumed_bytes
+                end = start + VAD_ITERATOR_WINDOW_BYTES
+                frame = pcm16le_bytes_to_float32_mono(
+                    bytes(state.audio_buffer[start:end])
+                )
+                event = iterator(torch.from_numpy(frame))
+                if event is not None:
+                    if "start" in event:
+                        state.vad_active_speech_start_sample = int(event["start"])
+                    elif "end" in event:
+                        speech_end = int(event["end"])
+                        speech_start = state.vad_active_speech_start_sample
+                        if speech_start is None:
+                            speech_start = max(
+                                0, speech_end - VAD_ITERATOR_WINDOW_SAMPLES
+                            )
+                        if speech_end < speech_start:
+                            speech_end = speech_start
+                        state.vad_total_speech_samples += speech_end - speech_start
+                        state.vad_last_speech_end_sample = speech_end
+                        state.vad_active_speech_start_sample = None
+                state.vad_iterator_consumed_bytes = end
 
-        last_end = int(speech_timestamps[-1]["end"])
-        trailing_samples = max(0, buffered_samples - last_end)
-        trailing_silence_ms = (trailing_samples / float(INPUT_SAMPLE_RATE)) * 1000.0
-        if trailing_silence_ms >= turn_detection.min_silence_ms:
-            return True, "silence", trailing_silence_ms, buffered_sec
-        return False, "speech_active", trailing_silence_ms, buffered_sec
+            cursor_samples = buffered_samples
+            speech_samples = state.vad_total_speech_samples
+            if state.vad_active_speech_start_sample is not None:
+                speech_samples += max(
+                    0, cursor_samples - state.vad_active_speech_start_sample
+                )
+            if speech_samples <= 0:
+                return False, "no_speech", 0.0, buffered_sec
+
+            min_speech_samples = int(
+                (turn_detection.min_speech_ms / 1000.0) * float(INPUT_SAMPLE_RATE)
+            )
+            if speech_samples < max(0, min_speech_samples):
+                return False, "speech_too_short", 0.0, buffered_sec
+
+            if state.vad_active_speech_start_sample is not None:
+                return False, "speech_active", 0.0, buffered_sec
+
+            if state.vad_last_speech_end_sample is None:
+                return False, "speech_active", 0.0, buffered_sec
+
+            trailing_samples = max(0, cursor_samples - state.vad_last_speech_end_sample)
+            trailing_silence_ms = (trailing_samples / float(INPUT_SAMPLE_RATE)) * 1000.0
+            if trailing_silence_ms >= turn_detection.min_silence_ms:
+                return True, "silence", trailing_silence_ms, buffered_sec
+            return False, "speech_active", trailing_silence_ms, buffered_sec
 
     def cancel_response(self, session_id: str) -> None:
         logger.info("cancel_response requested session_id=%s", session_id)
@@ -586,6 +665,7 @@ class StreamingVoicebotEngine:
             config = self._normalize_config(state.config)
             audio_bytes = bytes(state.audio_buffer)
             state.audio_buffer.clear()
+            self._reset_vad_tracking_locked(state)
             user_text = state.pending_user_text
             state.pending_user_text = None
             state.turn_index += 1
