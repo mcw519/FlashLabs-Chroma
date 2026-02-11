@@ -16,11 +16,10 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
-
-from chroma.obs_logging import configure_root_logger
 
 try:
     import sounddevice as sd  # type: ignore
@@ -50,6 +49,35 @@ COLOR_CODES = {
     "blue": "\033[34m",
     "white": "\033[37m",
 }
+
+
+class _ComponentFilter(logging.Filter):
+    def __init__(self, component: str):
+        super().__init__()
+        self._component = component
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "component"):
+            record.component = self._component
+        return True
+
+
+class _JsonFormatter(logging.Formatter):
+    def __init__(self, component: str):
+        super().__init__()
+        self._component = component
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, object] = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "component": getattr(record, "component", self._component),
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=True)
 
 
 @dataclass
@@ -263,12 +291,25 @@ def _tag(name: str, color: str, enabled: bool) -> str:
 
 
 def _configure_logging(level_name: str) -> None:
-    configure_root_logger(
-        component="ws_client",
-        env_level_key="CHROMA_CLIENT_LOG_LEVEL",
-        default_level="INFO",
-        level_name=level_name,
-    )
+    default_level = "INFO"
+    env_level_key = "CHROMA_CLIENT_LOG_LEVEL"
+    raw_level = (level_name or os.getenv(env_level_key, default_level)).upper()
+    resolved_level = getattr(logging, raw_level, logging.INFO)
+
+    log_format = os.getenv("CHROMA_LOG_FORMAT", "plain").strip().lower()
+    if log_format == "json":
+        formatter: logging.Formatter = _JsonFormatter("ws_client")
+    else:
+        formatter = logging.Formatter("%(levelname)s | %(component)s | %(message)s")
+
+    root = logging.getLogger()
+    root.handlers.clear()
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+    handler.addFilter(_ComponentFilter("ws_client"))
+    root.addHandler(handler)
+    root.setLevel(resolved_level)
 
 
 def _prompt_device_choice(
