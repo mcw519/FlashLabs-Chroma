@@ -29,6 +29,7 @@ from chroma.engine import (
     float32_to_pcm16le_bytes,
     pcm16le_bytes_to_float32_mono,
 )
+from chroma.obs_logging import configure_root_logger
 
 DEFAULT_ICE_SERVER = "stun:stun.l.google.com:19302"
 
@@ -223,7 +224,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-text-new-tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top-p", type=float, default=0.9)
-    parser.add_argument("--output-chunk-sec", type=float, default=0.5)
+    parser.add_argument("--output-chunk-sec", type=float, default=0.24)
     parser.add_argument("--use-half-precision", action="store_true")
     parser.add_argument("--disable-text", action="store_true")
     parser.add_argument("--host", type=str, default="0.0.0.0")
@@ -234,7 +235,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
+    configure_root_logger(component="webrtc_server", default_level="INFO")
     args = parse_args()
     if args.prompt_speaker not in PROMPT_SPEAKERS:
         raise ValueError(f"Invalid prompt speaker. Choose from: {PROMPT_SPEAKERS}")

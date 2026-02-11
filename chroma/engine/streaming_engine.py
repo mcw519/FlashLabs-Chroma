@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
-import os
 import queue
 import threading
 import time
@@ -11,7 +10,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterator
 
-import colorlog
 import numpy as np
 import torch
 import torchaudio
@@ -23,6 +21,7 @@ from transformers.generation.stopping_criteria import (
 )
 from transformers.generation.streamers import BaseStreamer
 
+from chroma.obs_logging import configure_component_logger
 from chroma.pretrained import DEFAULT_CHROMA_MODEL_ID, resolve_model_id_and_cache_dir
 
 from .bot_config import load_bot_config
@@ -35,31 +34,25 @@ from .types import (
     ResponseStartedEvent,
     ResponseTextDeltaEvent,
     SessionConfig,
+    TurnDetectionConfig,
 )
 
 logger = logging.getLogger(__name__)
 
-_COLORLOG_CONFIGURED = False
+_ENGINE_LOGGING_CONFIGURED = False
 
 
 def _configure_engine_logging() -> None:
-    global _COLORLOG_CONFIGURED
-    if _COLORLOG_CONFIGURED:
+    global _ENGINE_LOGGING_CONFIGURED
+    if _ENGINE_LOGGING_CONFIGURED:
         return
-
-    level_name = os.getenv("CHROMA_ENGINE_LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
-    formatter = colorlog.ColoredFormatter(
-        "%(log_color)s%(levelname)-8s%(reset)s | %(cyan)sengine%(reset)s | %(message)s"
+    configure_component_logger(
+        logger,
+        component="engine",
+        env_level_key="CHROMA_ENGINE_LOG_LEVEL",
+        default_level="INFO",
     )
-    handler = colorlog.StreamHandler()
-    handler.setFormatter(formatter)
-
-    if not logger.handlers:
-        logger.addHandler(handler)
-    logger.setLevel(level)
-    logger.propagate = False
-    _COLORLOG_CONFIGURED = True
+    _ENGINE_LOGGING_CONFIGURED = True
 
 
 def _shape(value: Any) -> str:
@@ -77,16 +70,6 @@ def _clip_text(text: str | None, max_chars: int = 160) -> str:
     if len(stripped) <= max_chars:
         return stripped
     return stripped[: max_chars - 3] + "..."
-
-
-_ANSI_RESET = "\033[0m"
-_ANSI_QUERY = "\033[38;5;214m"
-_ANSI_HISTORY = "\033[38;5;45m"
-_UNSET = object()
-
-
-def _colorize(text: str, color: str) -> str:
-    return f"{color}{text}{_ANSI_RESET}"
 
 
 PROMPT_SPEAKERS = [
@@ -263,7 +246,7 @@ class _EngineAudioStreamer(BaseStreamer):
             "%sstreamer decode_frames frame_count=%s", self.log_prefix, len(frames)
         )
         audio_codes = torch.stack(frames).to(self.model.device)
-        max_token_id = 2047  # align to SGLang version
+        max_token_id = min(2047, int(getattr(self.model.config, "vocab_size", 2048)) - 1)
         audio_codes = audio_codes.clamp(min=0, max=max_token_id)
         audio_values = self.model.codec_model.decode(
             audio_codes.transpose(0, 1).unsqueeze(0)
@@ -432,66 +415,12 @@ class StreamingVoicebotEngine:
             config,
         )
 
-    def update_session(self, session_id: str, **kwargs: Any) -> None:
-        logger.debug("update_session session_id=%s kwargs=%s", session_id, kwargs)
+    def update_session(self, session_id: str, config: SessionConfig) -> None:
+        logger.debug("update_session session_id=%s requested_config=%s", session_id, config)
         state = self._get_session(session_id)
+        normalized = self._normalize_config(config)
         with state.lock:
-            config = state.config
-            speaker = kwargs.get("speaker")
-            memory_turns = kwargs.get("memory_turns")
-            output_chunk_sec = kwargs.get("output_chunk_sec")
-            text_mode = kwargs.get("text_mode")
-            include_transcript_in_query = kwargs.get("include_transcript_in_query")
-            auto_commit = kwargs.get("auto_commit")
-            vad_threshold = kwargs.get("vad_threshold")
-            vad_min_speech_ms = kwargs.get("vad_min_speech_ms")
-            vad_min_silence_ms = kwargs.get("vad_min_silence_ms")
-            vad_speech_pad_ms = kwargs.get("vad_speech_pad_ms")
-            trim_with_vad = kwargs.get("trim_with_vad")
-            system_prompt = kwargs.get("system_prompt", _UNSET)
-            merged = SessionConfig(
-                speaker=config.speaker if speaker is None else speaker,
-                memory_turns=config.memory_turns
-                if memory_turns is None
-                else memory_turns,
-                output_chunk_sec=config.output_chunk_sec
-                if output_chunk_sec is None
-                else output_chunk_sec,
-                text_mode=config.text_mode if text_mode is None else text_mode,
-                include_transcript_in_query=(
-                    config.include_transcript_in_query
-                    if include_transcript_in_query is None
-                    else include_transcript_in_query
-                ),
-                auto_commit=(
-                    config.auto_commit if auto_commit is None else auto_commit
-                ),
-                vad_threshold=(
-                    config.vad_threshold if vad_threshold is None else vad_threshold
-                ),
-                vad_min_speech_ms=(
-                    config.vad_min_speech_ms
-                    if vad_min_speech_ms is None
-                    else vad_min_speech_ms
-                ),
-                vad_min_silence_ms=(
-                    config.vad_min_silence_ms
-                    if vad_min_silence_ms is None
-                    else vad_min_silence_ms
-                ),
-                vad_speech_pad_ms=(
-                    config.vad_speech_pad_ms
-                    if vad_speech_pad_ms is None
-                    else vad_speech_pad_ms
-                ),
-                trim_with_vad=(
-                    config.trim_with_vad if trim_with_vad is None else trim_with_vad
-                ),
-                system_prompt=(
-                    config.system_prompt if system_prompt is _UNSET else system_prompt
-                ),
-            )
-            state.config = self._normalize_config(merged)
+            state.config = normalized
             logger.debug(
                 "session config updated session_id=%s config=%s",
                 session_id,
@@ -509,12 +438,14 @@ class StreamingVoicebotEngine:
                 text_mode=config.text_mode,
                 include_transcript_in_query=config.include_transcript_in_query,
                 system_prompt=config.system_prompt,
-                auto_commit=config.auto_commit,
-                vad_threshold=config.vad_threshold,
-                vad_min_speech_ms=config.vad_min_speech_ms,
-                vad_min_silence_ms=config.vad_min_silence_ms,
-                vad_speech_pad_ms=config.vad_speech_pad_ms,
                 trim_with_vad=config.trim_with_vad,
+                turn_detection=TurnDetectionConfig(
+                    mode=config.turn_detection.mode,
+                    threshold=config.turn_detection.threshold,
+                    min_speech_ms=config.turn_detection.min_speech_ms,
+                    min_silence_ms=config.turn_detection.min_silence_ms,
+                    speech_pad_ms=config.turn_detection.speech_pad_ms,
+                ),
             )
 
     def set_pending_user_text(self, session_id: str, text: str | None) -> None:
@@ -566,9 +497,10 @@ class StreamingVoicebotEngine:
         with state.lock:
             config = self._normalize_config(state.config)
             audio_bytes = bytes(state.audio_buffer)
+        turn_detection = config.turn_detection
 
-        if not config.auto_commit:
-            return False, "disabled", 0.0, 0.0
+        if turn_detection.mode != "server_vad":
+            return False, "mode_client_commit", 0.0, 0.0
 
         if not audio_bytes:
             return False, "empty", 0.0, 0.0
@@ -584,10 +516,10 @@ class StreamingVoicebotEngine:
             audio_tensor,
             self._vad_model,
             sampling_rate=INPUT_SAMPLE_RATE,
-            threshold=config.vad_threshold,
-            min_speech_duration_ms=config.vad_min_speech_ms,
-            min_silence_duration_ms=config.vad_min_silence_ms,
-            speech_pad_ms=config.vad_speech_pad_ms,
+            threshold=turn_detection.threshold,
+            min_speech_duration_ms=turn_detection.min_speech_ms,
+            min_silence_duration_ms=turn_detection.min_silence_ms,
+            speech_pad_ms=turn_detection.speech_pad_ms,
         )
         if not speech_timestamps:
             return False, "no_speech", 0.0, buffered_sec
@@ -595,7 +527,7 @@ class StreamingVoicebotEngine:
         last_end = int(speech_timestamps[-1]["end"])
         trailing_samples = max(0, buffered_samples - last_end)
         trailing_silence_ms = (trailing_samples / float(INPUT_SAMPLE_RATE)) * 1000.0
-        if trailing_silence_ms >= config.vad_min_silence_ms:
+        if trailing_silence_ms >= turn_detection.min_silence_ms:
             return True, "silence", trailing_silence_ms, buffered_sec
         return False, "speech_active", trailing_silence_ms, buffered_sec
 
@@ -698,7 +630,7 @@ class StreamingVoicebotEngine:
             raw_seconds,
         )
         if config.trim_with_vad:
-            audio_16k = self._trim_with_vad(audio_16k)
+            audio_16k = self._trim_with_vad(audio_16k, config.turn_detection)
         trimmed_seconds = audio_16k.shape[-1] / INPUT_SAMPLE_RATE
         logger.debug(
             "commit_turn vad trimmed session_id=%s turn_id=%s trimmed_seconds=%.3f",
@@ -1036,11 +968,21 @@ class StreamingVoicebotEngine:
             yield item
         logger.debug("commit_turn_sync end session_id=%s", session_id)
 
-    def _trim_with_vad(self, audio_16k: np.ndarray) -> np.ndarray:
+    def _trim_with_vad(
+        self,
+        audio_16k: np.ndarray,
+        turn_detection: TurnDetectionConfig,
+    ) -> np.ndarray:
         logger.debug("vad trim start audio_shape=%s", _shape(audio_16k))
         audio_tensor = torch.from_numpy(audio_16k)
         speech_timestamps = get_speech_timestamps(
-            audio_tensor, self._vad_model, sampling_rate=INPUT_SAMPLE_RATE
+            audio_tensor,
+            self._vad_model,
+            sampling_rate=INPUT_SAMPLE_RATE,
+            threshold=turn_detection.threshold,
+            min_speech_duration_ms=turn_detection.min_speech_ms,
+            min_silence_duration_ms=turn_detection.min_silence_ms,
+            speech_pad_ms=turn_detection.speech_pad_ms,
         )
         if not speech_timestamps:
             logger.debug("vad found no speech; keep original audio")
@@ -1146,7 +1088,12 @@ class StreamingVoicebotEngine:
                 {"role": "user", "content": user_content},
             ]
         ]
-        logger.info(_colorize(f"[THINKER's text input]\n {system_text}", _ANSI_QUERY))
+        logger.info(
+            "thinker.input_prompt session_id=%s turn_id=%s prompt=%s",
+            session_id,
+            turn_id,
+            _clip_text(system_text, max_chars=520),
+        )
         inputs = self.processor(
             conversation,
             add_generation_prompt=True,
@@ -1182,16 +1129,16 @@ class StreamingVoicebotEngine:
             else "(empty memory context)"
         )
         logger.info(
-            "input context session_id=%s turn_id=%s %s",
+            "input context session_id=%s turn_id=%s query=%s",
             session_id,
             turn_id,
-            _colorize(f"QUERY   [{query_mode}] {query_preview}", _ANSI_QUERY),
+            f"[{query_mode}] {query_preview}",
         )
         logger.info(
-            "input context session_id=%s turn_id=%s %s",
+            "input context session_id=%s turn_id=%s history=%s",
             session_id,
             turn_id,
-            _colorize(f"HISTORY {history_preview}", _ANSI_HISTORY),
+            history_preview,
         )
 
     @torch.no_grad()
@@ -1231,7 +1178,7 @@ class StreamingVoicebotEngine:
         if not text:
             logger.debug("generate_text decoded empty text")
             return None
-        logger.info(_colorize(f"[THINKER's output] {_clip_text(text)}", _ANSI_QUERY))
+        logger.info("thinker.output text=%s", _clip_text(text))
         if text_mode == "final":
             logger.debug("generate_text final mode length=%s", len(text))
             return text
@@ -1295,13 +1242,18 @@ class StreamingVoicebotEngine:
             default=False,
         )
         system_prompt = self._normalize_session_prompt(config.system_prompt)
-        auto_commit = self._coerce_bool(config.auto_commit, default=True)
-        vad_threshold = float(config.vad_threshold)
-        if not (0.0 < vad_threshold <= 1.0):
-            vad_threshold = 0.5
-        vad_min_speech_ms = max(0, int(config.vad_min_speech_ms))
-        vad_min_silence_ms = max(0, int(config.vad_min_silence_ms))
-        vad_speech_pad_ms = max(0, int(config.vad_speech_pad_ms))
+        turn_detection = config.turn_detection
+        if not isinstance(turn_detection, TurnDetectionConfig):
+            raise ValueError("turn_detection must be an object")
+        mode = turn_detection.mode
+        if mode not in {"client_commit", "server_vad"}:
+            mode = "server_vad"
+        threshold = float(turn_detection.threshold)
+        if not (0.0 < threshold <= 1.0):
+            threshold = 0.5
+        min_speech_ms = max(0, int(turn_detection.min_speech_ms))
+        min_silence_ms = max(0, int(turn_detection.min_silence_ms))
+        speech_pad_ms = max(0, int(turn_detection.speech_pad_ms))
         trim_with_vad = self._coerce_bool(config.trim_with_vad, default=False)
 
         normalized = SessionConfig(
@@ -1311,12 +1263,14 @@ class StreamingVoicebotEngine:
             text_mode=text_mode,
             include_transcript_in_query=include_transcript_in_query,
             system_prompt=system_prompt,
-            auto_commit=auto_commit,
-            vad_threshold=vad_threshold,
-            vad_min_speech_ms=vad_min_speech_ms,
-            vad_min_silence_ms=vad_min_silence_ms,
-            vad_speech_pad_ms=vad_speech_pad_ms,
             trim_with_vad=trim_with_vad,
+            turn_detection=TurnDetectionConfig(
+                mode=mode,
+                threshold=threshold,
+                min_speech_ms=min_speech_ms,
+                min_silence_ms=min_silence_ms,
+                speech_pad_ms=speech_pad_ms,
+            ),
         )
         logger.debug("normalize_config output=%s", normalized)
         return normalized

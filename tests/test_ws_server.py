@@ -13,6 +13,7 @@ from chroma.engine.types import (
     ResponseStartedEvent,
     ResponseTextDeltaEvent,
     SessionConfig,
+    TurnDetectionConfig,
 )
 from chroma.transport.ws_server import VoicebotWebSocketServer
 
@@ -45,72 +46,21 @@ class FakeEngine:
             text_mode=config.text_mode,
             include_transcript_in_query=config.include_transcript_in_query,
             system_prompt=normalized_prompt,
-            auto_commit=config.auto_commit,
-            vad_threshold=config.vad_threshold,
-            vad_min_speech_ms=config.vad_min_speech_ms,
-            vad_min_silence_ms=config.vad_min_silence_ms,
-            vad_speech_pad_ms=config.vad_speech_pad_ms,
             trim_with_vad=config.trim_with_vad,
+            turn_detection=TurnDetectionConfig(
+                mode=config.turn_detection.mode,
+                threshold=config.turn_detection.threshold,
+                min_speech_ms=config.turn_detection.min_speech_ms,
+                min_silence_ms=config.turn_detection.min_silence_ms,
+                speech_pad_ms=config.turn_detection.speech_pad_ms,
+            ),
         )
         self.sessions[session_id] = {"config": normalized, "audio": bytearray()}
 
-    def update_session(self, session_id, **kwargs) -> None:
+    def update_session(self, session_id, config) -> None:
         if session_id not in self.sessions:
             raise ValueError("missing session")
-        config = self.sessions[session_id]["config"]
-        if "system_prompt" in kwargs:
-            system_prompt = self._normalize_system_prompt(kwargs.get("system_prompt"))
-        else:
-            system_prompt = config.system_prompt
-        self.sessions[session_id]["config"] = SessionConfig(
-            speaker=config.speaker if kwargs.get("speaker") is None else kwargs.get("speaker"),
-            memory_turns=(
-                config.memory_turns
-                if kwargs.get("memory_turns") is None
-                else kwargs.get("memory_turns")
-            ),
-            output_chunk_sec=(
-                config.output_chunk_sec
-                if kwargs.get("output_chunk_sec") is None
-                else kwargs.get("output_chunk_sec")
-            ),
-            text_mode=config.text_mode if kwargs.get("text_mode") is None else kwargs.get("text_mode"),
-            include_transcript_in_query=(
-                config.include_transcript_in_query
-                if kwargs.get("include_transcript_in_query") is None
-                else kwargs.get("include_transcript_in_query")
-            ),
-            system_prompt=system_prompt,
-            auto_commit=(
-                config.auto_commit if kwargs.get("auto_commit") is None else kwargs.get("auto_commit")
-            ),
-            vad_threshold=(
-                config.vad_threshold
-                if kwargs.get("vad_threshold") is None
-                else kwargs.get("vad_threshold")
-            ),
-            vad_min_speech_ms=(
-                config.vad_min_speech_ms
-                if kwargs.get("vad_min_speech_ms") is None
-                else kwargs.get("vad_min_speech_ms")
-            ),
-            vad_min_silence_ms=(
-                config.vad_min_silence_ms
-                if kwargs.get("vad_min_silence_ms") is None
-                else kwargs.get("vad_min_silence_ms")
-            ),
-            vad_speech_pad_ms=(
-                config.vad_speech_pad_ms
-                if kwargs.get("vad_speech_pad_ms") is None
-                else kwargs.get("vad_speech_pad_ms")
-            ),
-            trim_with_vad=(
-                config.trim_with_vad
-                if kwargs.get("trim_with_vad") is None
-                else kwargs.get("trim_with_vad")
-            ),
-        )
-        self.sessions[session_id]["updates"] = kwargs
+        self.create_session(session_id, config)
 
     def set_pending_user_text(self, session_id, text) -> None:
         self.pending_text[session_id] = text
@@ -128,7 +78,13 @@ class FakeEngine:
         return self.sessions[session_id]["config"]
 
     def should_auto_commit(self, session_id):
-        return False, "disabled", 0.0, 0.0
+        config = self.sessions[session_id]["config"]
+        if config.turn_detection.mode == "server_vad" and self.sessions[session_id]["audio"]:
+            return True, "silence", 600.0, 0.6
+        return False, "mode_client_commit", 0.0, 0.0
+
+    def get_buffered_audio(self, session_id) -> bytes:
+        return bytes(self.sessions[session_id]["audio"])
 
     async def commit_turn(self, session_id):
         turn_id = "1"
@@ -177,34 +133,34 @@ async def _stop_server(task: asyncio.Task) -> None:
         pass
 
 
-def test_ws_audio_commit_flow() -> None:
+def test_ws_input_turn_commit_flow() -> None:
     async def _run() -> None:
         engine, task, url = await _start_server()
         try:
             async with websockets.connect(url) as ws:
-                await ws.send('{"type":"session.start","session_id":"s1"}')
-                started = await ws.recv()
-                assert "session.started" in started
+                await ws.send('{"type":"session.open","session_id":"s1"}')
+                opened = await ws.recv()
+                assert "session.opened" in opened
 
                 audio_b64 = base64.b64encode(b"\x00\x00\x01\x00").decode("ascii")
                 await ws.send(
-                    '{"type":"audio.append","session_id":"s1","audio_b64":"'
+                    '{"type":"input.audio.append","session_id":"s1","audio_b64":"'
                     + audio_b64
                     + '"}'
                 )
-                appended = await ws.recv()
-                assert "audio.appended" in appended
+                accepted = await ws.recv()
+                assert "input.audio.accepted" in accepted
 
                 await ws.send(
-                    '{"type":"audio.commit","session_id":"s1","transcript":"hello"}'
+                    '{"type":"input.turn.commit","session_id":"s1","transcript":"hello"}'
                 )
-                stream_started = await ws.recv()
+                stream_opened = await ws.recv()
                 event1 = await ws.recv()
                 event2 = await ws.recv()
                 event3 = await ws.recv()
                 event4 = await ws.recv()
 
-                assert "response.stream.started" in stream_started
+                assert "response.stream.opened" in stream_opened
                 assert "response.started" in event1
                 assert "response.audio.delta" in event2
                 assert "response.text.delta" in event3
@@ -216,22 +172,23 @@ def test_ws_audio_commit_flow() -> None:
     asyncio.run(_run())
 
 
-def test_ws_cancel_idempotent() -> None:
+def test_ws_cancel_has_no_ack() -> None:
     async def _run() -> None:
         engine, task, url = await _start_server()
         try:
             async with websockets.connect(url) as ws:
-                await ws.send('{"type":"session.start","session_id":"s2"}')
+                await ws.send('{"type":"session.open","session_id":"s2"}')
                 await ws.recv()
 
                 await ws.send('{"type":"response.cancel","session_id":"s2"}')
-                resp1 = await ws.recv()
-                await ws.send('{"type":"response.cancel","session_id":"s2"}')
-                resp2 = await ws.recv()
+                await asyncio.sleep(0.05)
+                assert engine.cancel_count["s2"] == 1
 
-                assert "response.cancelled.requested" in resp1
-                assert "response.cancelled.requested" in resp2
-                assert engine.cancel_count["s2"] == 2
+                try:
+                    payload = await asyncio.wait_for(ws.recv(), timeout=0.2)
+                except asyncio.TimeoutError:
+                    payload = ""
+                assert payload == ""
         finally:
             await _stop_server(task)
 
@@ -253,7 +210,7 @@ def test_ws_invalid_payload_returns_error() -> None:
     asyncio.run(_run())
 
 
-def test_ws_session_start_with_system_prompt() -> None:
+def test_ws_session_open_with_system_prompt() -> None:
     async def _run() -> None:
         engine, task, url = await _start_server()
         try:
@@ -261,15 +218,15 @@ def test_ws_session_start_with_system_prompt() -> None:
                 await ws.send(
                     json.dumps(
                         {
-                            "type": "session.start",
+                            "type": "session.open",
                             "session_id": "s3",
                             "config": {"system_prompt": "  You are a tutor.  "},
                         }
                     )
                 )
-                started = json.loads(await ws.recv())
-                assert started["type"] == "session.started"
-                assert started["config"]["system_prompt"] == "You are a tutor."
+                opened = json.loads(await ws.recv())
+                assert opened["type"] == "session.opened"
+                assert opened["config"]["system_prompt"] == "You are a tutor."
                 assert engine.sessions["s3"]["config"].system_prompt == "You are a tutor."
         finally:
             await _stop_server(task)
@@ -282,7 +239,7 @@ def test_ws_session_update_set_and_clear_system_prompt() -> None:
         engine, task, url = await _start_server()
         try:
             async with websockets.connect(url) as ws:
-                await ws.send(json.dumps({"type": "session.start", "session_id": "s4"}))
+                await ws.send(json.dumps({"type": "session.open", "session_id": "s4"}))
                 await ws.recv()
 
                 await ws.send(
@@ -340,7 +297,7 @@ def test_ws_invalid_system_prompt_returns_request_failed() -> None:
                 await ws.send(
                     json.dumps(
                         {
-                            "type": "session.start",
+                            "type": "session.open",
                             "session_id": "s5",
                             "config": {"system_prompt": "   "},
                         }
@@ -364,7 +321,7 @@ def test_ws_system_prompt_too_long_returns_request_failed() -> None:
                 await ws.send(
                     json.dumps(
                         {
-                            "type": "session.start",
+                            "type": "session.open",
                             "session_id": "s6",
                             "config": {"system_prompt": "x" * 4001},
                         }
@@ -385,11 +342,15 @@ def test_ws_audio_append_invalid_base64_returns_invalid_base64_code() -> None:
         _, task, url = await _start_server()
         try:
             async with websockets.connect(url) as ws:
-                await ws.send(json.dumps({"type": "session.start", "session_id": "s7"}))
+                await ws.send(json.dumps({"type": "session.open", "session_id": "s7"}))
                 await ws.recv()
                 await ws.send(
                     json.dumps(
-                        {"type": "audio.append", "session_id": "s7", "audio_b64": "###"}
+                        {
+                            "type": "input.audio.append",
+                            "session_id": "s7",
+                            "audio_b64": "###",
+                        }
                     )
                 )
                 error = json.loads(await ws.recv())

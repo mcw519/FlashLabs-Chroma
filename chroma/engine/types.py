@@ -3,23 +3,12 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
-TextMode = Literal["none", "sentence", "final"]
-
-
-@dataclass(slots=True)
-class SessionConfig:
-    speaker: str = "scarlett_johansson"
-    memory_turns: int = 6
-    output_chunk_sec: float = 0.24
-    text_mode: TextMode = "sentence"
-    include_transcript_in_query: bool = False
-    system_prompt: str | None = None
-    auto_commit: bool = True
-    vad_threshold: float = 0.5
-    vad_min_speech_ms: int = 250
-    vad_min_silence_ms: int = 500
-    vad_speech_pad_ms: int = 200
-    trim_with_vad: bool = False
+from chroma.session_schema import (
+    SessionConfigV2 as SessionConfig,
+    TextMode,
+    TurnDetectionConfig,
+    TurnDetectionMode,
+)
 
 
 @dataclass(slots=True)
@@ -100,5 +89,7 @@ __all__ = [
     "ResponseTextDeltaEvent",
     "SessionConfig",
     "TextMode",
+    "TurnDetectionConfig",
+    "TurnDetectionMode",
     "event_to_dict",
 ]

@@ -11,9 +11,12 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from chroma.engine.streaming_engine import StreamingVoicebotEngine
-from chroma.engine.types import ErrorEvent, SessionConfig, event_to_dict
+from chroma.engine.types import ErrorEvent, event_to_dict
+from chroma.obs_logging import configure_component_logger
+from chroma.session_schema import session_config_from_payload, session_config_to_dict
 
 logger = logging.getLogger(__name__)
+_LOGGER_CONFIGURED = False
 
 
 class RequestError(ValueError):
@@ -27,6 +30,19 @@ class AudioTranscriber(Protocol):
     def transcribe_pcm16_16k(self, pcm16_16k: bytes) -> str | None: ...
 
 
+def _configure_transport_logging() -> None:
+    global _LOGGER_CONFIGURED
+    if _LOGGER_CONFIGURED:
+        return
+    configure_component_logger(
+        logger,
+        component="ws_server",
+        env_level_key="CHROMA_SERVER_LOG_LEVEL",
+        default_level="INFO",
+    )
+    _LOGGER_CONFIGURED = True
+
+
 class VoicebotWebSocketServer:
     def __init__(
         self,
@@ -38,6 +54,7 @@ class VoicebotWebSocketServer:
         asr_transcriber: AudioTranscriber | None = None,
         server_asr_timeout_sec: float = 1.2,
     ) -> None:
+        _configure_transport_logging()
         self.engine = engine
         self.host = host
         self.port = port
@@ -46,7 +63,7 @@ class VoicebotWebSocketServer:
         self.server_asr_timeout_sec = max(0.05, float(server_asr_timeout_sec))
 
     async def serve_forever(self) -> None:
-        logger.info("Starting WebSocket server on ws://%s:%s", self.host, self.port)
+        logger.info("server start url=ws://%s:%s", self.host, self.port)
         async with websockets.serve(
             self._handle_connection,
             self.host,
@@ -80,13 +97,12 @@ class VoicebotWebSocketServer:
                 )
                 return
             if not await send_json(
-                {"type": "response.stream.started", "session_id": session_id}
+                {"type": "response.stream.opened", "session_id": session_id}
             ):
                 return
             logger.info("commit start session_id=%s source=%s", session_id, source)
             stream_task = asyncio.create_task(
                 self._handle_audio_commit(
-                    websocket=websocket,
                     request=request,
                     send_json=send_json,
                 )
@@ -101,11 +117,9 @@ class VoicebotWebSocketServer:
                     if session_id not in owned_sessions:
                         return
                     try:
-                        config = self.engine.get_session_config(session_id)
+                        self.engine.get_session_config(session_id)
                     except ValueError:
                         return
-                    if not config.auto_commit:
-                        continue
                     task = stream_tasks.get(session_id)
                     if task is not None and not task.done():
                         continue
@@ -122,7 +136,7 @@ class VoicebotWebSocketServer:
                         trailing_ms,
                     )
                     await _start_commit(
-                        {"type": "audio.commit", "session_id": session_id},
+                        {"type": "input.turn.commit", "session_id": session_id},
                         f"auto:{reason}",
                     )
             except asyncio.CancelledError:
@@ -133,7 +147,6 @@ class VoicebotWebSocketServer:
                 request = self._parse_json(raw_message)
                 if request is None:
                     await self._send_error(
-                        websocket,
                         ErrorEvent(
                             session_id=None,
                             code="bad_json",
@@ -146,7 +159,6 @@ class VoicebotWebSocketServer:
                 event_type = request.get("type")
                 if not isinstance(event_type, str):
                     await self._send_error(
-                        websocket,
                         ErrorEvent(
                             session_id=None,
                             code="missing_type",
@@ -157,8 +169,8 @@ class VoicebotWebSocketServer:
                     continue
 
                 try:
-                    if event_type == "session.start":
-                        response = self._handle_session_start(request, owned_sessions)
+                    if event_type == "session.open":
+                        response = self._handle_session_open(request, owned_sessions)
                         if not await send_json(response):
                             break
                         session_id = response.get("session_id")
@@ -170,18 +182,16 @@ class VoicebotWebSocketServer:
                         response = self._handle_session_update(request)
                         if not await send_json(response):
                             break
-                    elif event_type == "audio.append":
+                    elif event_type == "input.audio.append":
                         response = self._handle_audio_append(request)
                         if not await send_json(response):
                             break
-                    elif event_type == "audio.commit":
+                    elif event_type == "input.turn.commit":
                         await _start_commit(request, "client")
                     elif event_type == "response.cancel":
-                        response = self._handle_response_cancel(request)
-                        if not await send_json(response):
-                            break
-                    elif event_type == "session.end":
-                        response = self._handle_session_end(request, owned_sessions)
+                        self._handle_response_cancel(request)
+                    elif event_type == "session.close":
+                        response = self._handle_session_close(request, owned_sessions)
                         if not await send_json(response):
                             break
                         session_id = response.get("session_id")
@@ -190,7 +200,6 @@ class VoicebotWebSocketServer:
                             task.cancel()
                     else:
                         await self._send_error(
-                            websocket,
                             ErrorEvent(
                                 session_id=request.get("session_id"),
                                 code="unknown_type",
@@ -199,11 +208,10 @@ class VoicebotWebSocketServer:
                             send_json=send_json,
                         )
                 except ConnectionClosed:
-                    logger.info("WebSocket closed by client while handling event: %s", event_type)
+                    logger.info("client disconnected while handling event=%s", event_type)
                     break
                 except RequestError as exc:
                     await self._send_error(
-                        websocket,
                         ErrorEvent(
                             session_id=request.get("session_id"),
                             code=exc.code,
@@ -212,9 +220,8 @@ class VoicebotWebSocketServer:
                         send_json=send_json,
                     )
                 except Exception as exc:
-                    logger.exception("Failed to handle event: %s", event_type)
+                    logger.exception("request failed event=%s", event_type)
                     await self._send_error(
-                        websocket,
                         ErrorEvent(
                             session_id=request.get("session_id"),
                             code="request_failed",
@@ -223,7 +230,7 @@ class VoicebotWebSocketServer:
                         send_json=send_json,
                     )
         except ConnectionClosed:
-            logger.info("WebSocket connection closed")
+            logger.info("websocket closed")
         finally:
             for task in stream_tasks.values():
                 task.cancel()
@@ -237,84 +244,34 @@ class VoicebotWebSocketServer:
                 try:
                     self.engine.close_session(session_id)
                 except Exception:
-                    logger.exception("Failed to close session: %s", session_id)
+                    logger.exception("session close failed session_id=%s", session_id)
 
-    def _handle_session_start(self, request: dict[str, Any], owned_sessions: set[str]) -> dict[str, Any]:
+    def _handle_session_open(
+        self,
+        request: dict[str, Any],
+        owned_sessions: set[str],
+    ) -> dict[str, Any]:
         session_id = request.get("session_id") or str(uuid.uuid4())
-        config_payload = request.get("config") or {}
-        config = SessionConfig(
-            speaker=config_payload.get("speaker", "scarlett_johansson"),
-            memory_turns=config_payload.get("memory_turns", 6),
-            output_chunk_sec=config_payload.get("output_chunk_sec", 0.24),
-            text_mode=config_payload.get("text_mode", "sentence"),
-            include_transcript_in_query=config_payload.get("include_transcript_in_query", False),
-            system_prompt=config_payload.get("system_prompt"),
-            auto_commit=config_payload.get("auto_commit", True),
-            vad_threshold=config_payload.get("vad_threshold", 0.5),
-            vad_min_speech_ms=config_payload.get("vad_min_speech_ms", 250),
-            vad_min_silence_ms=config_payload.get("vad_min_silence_ms", 500),
-            vad_speech_pad_ms=config_payload.get("vad_speech_pad_ms", 200),
-            trim_with_vad=config_payload.get("trim_with_vad", False),
-        )
+        config = session_config_from_payload(request.get("config"))
         self.engine.create_session(session_id, config)
         owned_sessions.add(session_id)
         normalized = self.engine.get_session_config(session_id)
         return {
-            "type": "session.started",
+            "type": "session.opened",
             "session_id": session_id,
-            "config": {
-                "speaker": normalized.speaker,
-                "memory_turns": normalized.memory_turns,
-                "output_chunk_sec": normalized.output_chunk_sec,
-                "text_mode": normalized.text_mode,
-                "include_transcript_in_query": normalized.include_transcript_in_query,
-                "system_prompt": normalized.system_prompt,
-                "auto_commit": normalized.auto_commit,
-                "vad_threshold": normalized.vad_threshold,
-                "vad_min_speech_ms": normalized.vad_min_speech_ms,
-                "vad_min_silence_ms": normalized.vad_min_silence_ms,
-                "vad_speech_pad_ms": normalized.vad_speech_pad_ms,
-                "trim_with_vad": normalized.trim_with_vad,
-            },
+            "config": session_config_to_dict(normalized),
         }
 
     def _handle_session_update(self, request: dict[str, Any]) -> dict[str, Any]:
         session_id = self._require_session_id(request)
-        updates = request.get("config") or {}
-        update_kwargs: dict[str, Any] = {
-            "speaker": updates.get("speaker"),
-            "memory_turns": updates.get("memory_turns"),
-            "output_chunk_sec": updates.get("output_chunk_sec"),
-            "text_mode": updates.get("text_mode"),
-            "include_transcript_in_query": updates.get("include_transcript_in_query"),
-            "auto_commit": updates.get("auto_commit"),
-            "vad_threshold": updates.get("vad_threshold"),
-            "vad_min_speech_ms": updates.get("vad_min_speech_ms"),
-            "vad_min_silence_ms": updates.get("vad_min_silence_ms"),
-            "vad_speech_pad_ms": updates.get("vad_speech_pad_ms"),
-            "trim_with_vad": updates.get("trim_with_vad"),
-        }
-        if "system_prompt" in updates:
-            update_kwargs["system_prompt"] = updates.get("system_prompt")
-        self.engine.update_session(session_id, **update_kwargs)
+        base = self.engine.get_session_config(session_id)
+        config = session_config_from_payload(request.get("config"), base=base)
+        self.engine.update_session(session_id, config)
         normalized = self.engine.get_session_config(session_id)
         return {
             "type": "session.updated",
             "session_id": session_id,
-            "config": {
-                "speaker": normalized.speaker,
-                "memory_turns": normalized.memory_turns,
-                "output_chunk_sec": normalized.output_chunk_sec,
-                "text_mode": normalized.text_mode,
-                "include_transcript_in_query": normalized.include_transcript_in_query,
-                "system_prompt": normalized.system_prompt,
-                "auto_commit": normalized.auto_commit,
-                "vad_threshold": normalized.vad_threshold,
-                "vad_min_speech_ms": normalized.vad_min_speech_ms,
-                "vad_min_silence_ms": normalized.vad_min_silence_ms,
-                "vad_speech_pad_ms": normalized.vad_speech_pad_ms,
-                "trim_with_vad": normalized.trim_with_vad,
-            },
+            "config": session_config_to_dict(normalized),
         }
 
     def _handle_audio_append(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -329,14 +286,13 @@ class VoicebotWebSocketServer:
 
         self.engine.append_audio(session_id, audio_bytes)
         return {
-            "type": "audio.appended",
+            "type": "input.audio.accepted",
             "session_id": session_id,
             "num_bytes": len(audio_bytes),
         }
 
     async def _handle_audio_commit(
         self,
-        websocket,
         request: dict[str, Any],
         send_json: Callable[[dict[str, Any]], Awaitable[bool]],
     ) -> None:
@@ -380,7 +336,7 @@ class VoicebotWebSocketServer:
         except ConnectionClosed:
             return
         except Exception as exc:
-            logger.exception("audio.commit failed for session %s", request.get("session_id"))
+            logger.exception("commit failed session_id=%s", request.get("session_id"))
             await send_json(
                 event_to_dict(
                     ErrorEvent(
@@ -404,28 +360,28 @@ class VoicebotWebSocketServer:
             )
         except asyncio.TimeoutError:
             logger.warning(
-                "server_asr timed out session_id=%s timeout_sec=%.2f",
+                "server_asr timeout session_id=%s timeout_sec=%.2f",
                 session_id,
                 self.server_asr_timeout_sec,
             )
             return None
         except Exception:
-            logger.exception("server_asr failed session_id=%s", session_id)
+            logger.exception("server_asr failure session_id=%s", session_id)
             return None
 
-    def _handle_response_cancel(self, request: dict[str, Any]) -> dict[str, Any]:
+    def _handle_response_cancel(self, request: dict[str, Any]) -> None:
         session_id = self._require_session_id(request)
         self.engine.cancel_response(session_id)
-        return {
-            "type": "response.cancelled.requested",
-            "session_id": session_id,
-        }
 
-    def _handle_session_end(self, request: dict[str, Any], owned_sessions: set[str]) -> dict[str, Any]:
+    def _handle_session_close(
+        self,
+        request: dict[str, Any],
+        owned_sessions: set[str],
+    ) -> dict[str, Any]:
         session_id = self._require_session_id(request)
         self.engine.close_session(session_id)
         owned_sessions.discard(session_id)
-        return {"type": "session.ended", "session_id": session_id}
+        return {"type": "session.closed", "session_id": session_id}
 
     @staticmethod
     def _require_session_id(request: dict[str, Any]) -> str:
@@ -450,18 +406,10 @@ class VoicebotWebSocketServer:
 
     async def _send_error(
         self,
-        websocket,
         error_event: ErrorEvent,
-        send_json: Callable[[dict[str, Any]], Awaitable[bool]] | None = None,
+        send_json: Callable[[dict[str, Any]], Awaitable[bool]],
     ) -> None:
-        payload = event_to_dict(error_event)
-        if send_json is not None:
-            await send_json(payload)
-            return
-        try:
-            await websocket.send(json.dumps(payload, ensure_ascii=True))
-        except ConnectionClosed:
-            return
+        await send_json(event_to_dict(error_event))
 
 
 __all__ = ["VoicebotWebSocketServer"]

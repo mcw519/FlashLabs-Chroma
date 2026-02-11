@@ -8,9 +8,16 @@ from typing import Protocol
 import numpy as np
 import torch
 
+from chroma.obs_logging import configure_component_logger
 from chroma.pretrained import get_pretrained_cache_dir
 
 logger = logging.getLogger(__name__)
+configure_component_logger(
+    logger,
+    component="server_asr",
+    env_level_key="CHROMA_SERVER_LOG_LEVEL",
+    default_level="INFO",
+)
 
 INPUT_SAMPLE_RATE = 16000
 

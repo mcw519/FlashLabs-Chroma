@@ -6,23 +6,16 @@ import logging
 import time
 from typing import Optional
 
-import colorlog
 import torch
 import torchaudio
 from transformers import AutoModelForCausalLM, AutoProcessor
 
+from chroma.obs_logging import configure_root_logger
 from chroma.pretrained import DEFAULT_CHROMA_MODEL_ID, resolve_model_id_and_cache_dir
 
 
 def _configure_logging() -> None:
-    handler = colorlog.StreamHandler()
-    handler.setFormatter(
-        colorlog.ColoredFormatter("%(log_color)s%(levelname)s%(reset)s | %(message)s")
-    )
-    root_logger = colorlog.getLogger()
-    root_logger.handlers.clear()
-    root_logger.addHandler(handler)
-    root_logger.setLevel(logging.INFO)
+    configure_root_logger(component="offline_infer", default_level="INFO")
 
 
 _configure_logging()

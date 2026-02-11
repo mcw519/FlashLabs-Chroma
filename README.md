@@ -242,10 +242,10 @@ python scripts/run_realtime_webrtc.py --disable-text
 ### Streaming Voicebot WebSocket Server
 
 The new voicebot engine provides a reusable streaming backend with:
-- Session lifecycle (`session.start`, `session.update`, `session.end`)
-- Audio streaming input (`audio.append`, base64 PCM16 @ 16kHz)
+- Session lifecycle (`session.open`, `session.update`, `session.close`)
+- Audio streaming input (`input.audio.append`, base64 PCM16 @ 16kHz)
 - Incremental response output (`response.audio.delta`, base64 PCM16 @ 24kHz)
-- Turn control (`audio.commit`, `response.cancel`)
+- Turn control (`input.turn.commit`, `response.cancel`)
 
 Run the server:
 
@@ -278,21 +278,21 @@ python scripts/run_voicebot_ws.py \
 
 Minimal client event flow:
 ```json
-{"type":"session.start","session_id":"demo-1","config":{"include_transcript_in_query":false}}
-{"type":"audio.append","session_id":"demo-1","audio_b64":"..."}
-{"type":"audio.commit","session_id":"demo-1","transcript":"optional user text"}
+{"type":"session.open","session_id":"demo-1","config":{"include_transcript_in_query":false}}
+{"type":"input.audio.append","session_id":"demo-1","audio_b64":"..."}
+{"type":"input.turn.commit","session_id":"demo-1","transcript":"optional user text"}
 ```
 
 Per-session persona override:
 ```json
-{"type":"session.start","session_id":"demo-2","config":{"system_prompt":"You are a concise travel concierge."}}
+{"type":"session.open","session_id":"demo-2","config":{"system_prompt":"You are a concise travel concierge."}}
 {"type":"session.update","session_id":"demo-2","config":{"system_prompt":"You are a strict interview coach."}}
 {"type":"session.update","session_id":"demo-2","config":{"system_prompt":null}}
 ```
 
 `include_transcript_in_query` defaults to `false` (current behavior): transcript is stored in memory only.
 Set it to `true` to include transcript in the same turn's user query (`text + audio`).
-When `--server-asr-model` is enabled on server, `audio.commit.transcript` from client is ignored.
+When `--server-asr-model` is enabled on server, `input.turn.commit.transcript` from client is ignored.
 
 Microphone streaming client (local mic -> WebSocket):
 ```bash
@@ -302,13 +302,17 @@ python scripts/run_voicebot_ws_mic_client.py \
   --speaker scarlett_johansson
 ```
 
-The mic client auto-detects speech and sends `audio.commit` on pause, and will send
+The mic client auto-detects speech and sends `input.turn.commit` on pause, and will send
 `response.cancel` automatically when barge-in is detected during model playback.
 At startup it prompts for microphone/speaker device selection, and you can type `/quit`
 to disconnect gracefully.
 
-Detailed guide: `docs/VOICEBOT_WS_MIC_CLIENT.md`
-Streaming runtime internals: `docs/CHROMA_STREAMING_RUNTIME.md`
+Service spec (EN): `docs/service/STREAMING_SERVICE_SPEC.en.md`  
+服務規格（中文）：`docs/service/STREAMING_SERVICE_SPEC.zh.md`  
+Client guide (EN): `docs/service/CLIENT_USAGE.en.md`  
+Client 指南（中文）：`docs/service/CLIENT_USAGE.zh.md`  
+S2S pipeline (EN): `docs/model/S2S_PIPELINE.en.md`  
+S2S 鏈路（中文）：`docs/model/S2S_PIPELINE.zh.md`
 
 ## Troubleshooting
 

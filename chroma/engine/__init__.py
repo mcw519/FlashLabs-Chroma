@@ -16,6 +16,8 @@ from .types import (
     ResponseStartedEvent,
     ResponseTextDeltaEvent,
     SessionConfig,
+    TurnDetectionConfig,
+    TurnDetectionMode,
     event_to_dict,
 )
 
@@ -33,6 +35,8 @@ __all__ = [
     "ResponseTextDeltaEvent",
     "SessionConfig",
     "StreamingVoicebotEngine",
+    "TurnDetectionConfig",
+    "TurnDetectionMode",
     "event_to_dict",
     "float32_to_pcm16le_bytes",
     "load_bot_config",

@@ -5,9 +5,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import logging
 
 from chroma.engine import StreamingVoicebotEngine
+from chroma.obs_logging import configure_root_logger
 from chroma.transport import VoicebotWebSocketServer
 from chroma.transport.server_asr import build_server_asr_transcriber
 
@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-text-new-tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.9)
-    parser.add_argument("--output-chunk-sec", type=float, default=0.5)
+    parser.add_argument("--output-chunk-sec", type=float, default=0.24)
     parser.add_argument("--use-half-precision", action="store_true")
     parser.add_argument("--disable-text", action="store_true")
     parser.add_argument("--max-sessions", type=int, default=3)
@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
+    configure_root_logger(component="ws_server", default_level="INFO")
     args = parse_args()
 
     engine = StreamingVoicebotEngine(

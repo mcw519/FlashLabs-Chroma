@@ -20,6 +20,8 @@ from typing import Any
 
 import numpy as np
 
+from chroma.obs_logging import configure_root_logger
+
 try:
     import sounddevice as sd  # type: ignore
 except Exception as exc:  # pragma: no cover
@@ -175,33 +177,6 @@ class _PlaybackBuffer:
         return emitted, pending
 
 
-class _ColorFormatter(logging.Formatter):
-    LEVEL_COLORS = {
-        logging.DEBUG: "cyan",
-        logging.INFO: "green",
-        logging.WARNING: "yellow",
-        logging.ERROR: "red",
-        logging.CRITICAL: "magenta",
-    }
-
-    def __init__(self, use_color: bool) -> None:
-        super().__init__("%(levelname)s | %(message)s")
-        self.use_color = use_color
-
-    def format(self, record: logging.LogRecord) -> str:
-        original_levelname = record.levelname
-        if self.use_color:
-            color_name = self.LEVEL_COLORS.get(record.levelno)
-            if color_name:
-                record.levelname = (
-                    f"{COLOR_CODES[color_name]}{original_levelname}{RESET}"
-                )
-        try:
-            return super().format(record)
-        finally:
-            record.levelname = original_levelname
-
-
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -267,6 +242,8 @@ def _get_mic_chunk_with_timeout(
 def _should_use_color(no_color: bool) -> bool:
     if no_color:
         return False
+    if os.getenv("CHROMA_LOG_FORMAT", "plain").strip().lower() == "json":
+        return False
     if os.getenv("NO_COLOR") is not None:
         return False
     return sys.stderr.isatty()
@@ -285,14 +262,13 @@ def _tag(name: str, color: str, enabled: bool) -> str:
     return _paint(f"[{name}]", color, enabled)
 
 
-def _configure_logging(level_name: str, use_color: bool) -> None:
-    level = getattr(logging, level_name.upper(), logging.INFO)
-    root = logging.getLogger()
-    root.handlers.clear()
-    handler = logging.StreamHandler()
-    handler.setFormatter(_ColorFormatter(use_color))
-    root.addHandler(handler)
-    root.setLevel(level)
+def _configure_logging(level_name: str) -> None:
+    configure_root_logger(
+        component="ws_client",
+        env_level_key="CHROMA_CLIENT_LOG_LEVEL",
+        default_level="INFO",
+        level_name=level_name,
+    )
 
 
 def _prompt_device_choice(
@@ -386,9 +362,10 @@ async def run_client(args: argparse.Namespace) -> None:
     use_color = _should_use_color(args.no_color)
     session_id = args.session_id or f"mic-{uuid.uuid4().hex[:8]}"
     ws_url = _normalize_ws_url(args.url)
-    chunk_frames = max(1, int(INPUT_SAMPLE_RATE * (args.chunk_ms / 1000.0)))
-    output_chunk_frames = max(1, int(OUTPUT_SAMPLE_RATE * (args.chunk_ms / 1000.0)))
-    pre_roll_chunks = max(1, int(args.pre_roll_ms / args.chunk_ms))
+    client_chunk_ms = float(args.client_chunk_ms)
+    chunk_frames = max(1, int(INPUT_SAMPLE_RATE * (client_chunk_ms / 1000.0)))
+    output_chunk_frames = max(1, int(OUTPUT_SAMPLE_RATE * (client_chunk_ms / 1000.0)))
+    pre_roll_chunks = max(1, int(args.client_pre_roll_ms / client_chunk_ms))
     jitter_buffer_ms = max(0, int(args.jitter_buffer_ms))
     crossfade_ms = float(args.crossfade_ms)
     if crossfade_ms < 0.0 or crossfade_ms > MAX_CROSSFADE_MS:
@@ -480,39 +457,45 @@ async def run_client(args: argparse.Namespace) -> None:
             try:
                 await _send_json(
                     ws,
-                    {"type": "session.end", "session_id": session_id},
+                    {"type": "session.close", "session_id": session_id},
                     send_lock,
                 )
             except Exception:
                 pass
 
+        session_config: dict[str, Any] = {
+            "speaker": args.speaker,
+            "memory_turns": args.memory_turns,
+            "output_chunk_sec": args.output_chunk_sec,
+            "text_mode": args.text_mode,
+            "include_transcript_in_query": args.include_transcript_in_query,
+            "trim_with_vad": args.trim_with_vad,
+            "turn_detection": {
+                "mode": args.turn_detection_mode,
+                "threshold": args.turn_threshold,
+                "min_speech_ms": args.turn_min_speech_ms,
+                "min_silence_ms": args.turn_min_silence_ms,
+                "speech_pad_ms": args.turn_speech_pad_ms,
+            },
+        }
+        if args.system_prompt is not None:
+            session_config["system_prompt"] = args.system_prompt
+
         await _send_json(
             ws,
             {
-                "type": "session.start",
+                "type": "session.open",
                 "session_id": session_id,
-                "config": {
-                    "speaker": args.speaker,
-                    "memory_turns": args.memory_turns,
-                    "output_chunk_sec": args.output_chunk_sec,
-                    "text_mode": args.text_mode,
-                    "include_transcript_in_query": args.include_transcript_in_query,
-                    "auto_commit": args.server_auto_commit,
-                    "vad_threshold": args.server_vad_threshold,
-                    "vad_min_speech_ms": args.server_min_speech_ms,
-                    "vad_min_silence_ms": args.server_pause_ms,
-                    "vad_speech_pad_ms": args.server_pre_roll_ms,
-                    "trim_with_vad": args.server_trim_with_vad,
-                },
+                "config": session_config,
             },
             send_lock,
         )
 
         first = json.loads(await ws.recv())
-        if first.get("type") != "session.started":
+        if first.get("type") != "session.opened":
             raise RuntimeError(f"Failed to start session: {first}")
         logging.info(
-            "%s Session started: %s", _tag("SESSION", "cyan", use_color), first
+            "%s Session opened: %s", _tag("SESSION", "cyan", use_color), first
         )
 
         async def receiver() -> None:
@@ -530,7 +513,7 @@ async def run_client(args: argparse.Namespace) -> None:
                 msg = json.loads(raw)
                 event_type = msg.get("type")
 
-                if event_type == "response.stream.started":
+                if event_type == "response.stream.opened":
                     logging.info(
                         "%s Turn stream started", _tag("TURN", "blue", use_color)
                     )
@@ -617,8 +600,8 @@ async def run_client(args: argparse.Namespace) -> None:
                 if chunk is None:
                     continue
                 rms = _rms_from_pcm16le(chunk)
-                is_voice = rms >= args.vad_threshold
-                if args.continuous_stream:
+                is_voice = rms >= args.client_vad_threshold
+                if args.turn_detection_mode == "server_vad":
                     if state.generating and is_voice and not state.barge_in_sent:
                         await _send_json(
                             ws,
@@ -633,7 +616,7 @@ async def run_client(args: argparse.Namespace) -> None:
                     await _send_json(
                         ws,
                         {
-                            "type": "audio.append",
+                            "type": "input.audio.append",
                             "session_id": session_id,
                             "audio_b64": base64.b64encode(chunk).decode("ascii"),
                         },
@@ -659,7 +642,7 @@ async def run_client(args: argparse.Namespace) -> None:
                         )
 
                     state.in_turn = True
-                    state.voice_ms = float(args.chunk_ms)
+                    state.voice_ms = float(args.client_chunk_ms)
                     state.silence_ms = 0.0
 
                     while pre_roll:
@@ -667,7 +650,7 @@ async def run_client(args: argparse.Namespace) -> None:
                         await _send_json(
                             ws,
                             {
-                                "type": "audio.append",
+                                "type": "input.audio.append",
                                 "session_id": session_id,
                                 "audio_b64": base64.b64encode(frame).decode("ascii"),
                             },
@@ -678,7 +661,7 @@ async def run_client(args: argparse.Namespace) -> None:
                 await _send_json(
                     ws,
                     {
-                        "type": "audio.append",
+                        "type": "input.audio.append",
                         "session_id": session_id,
                         "audio_b64": base64.b64encode(chunk).decode("ascii"),
                     },
@@ -686,17 +669,17 @@ async def run_client(args: argparse.Namespace) -> None:
                 )
 
                 if is_voice:
-                    state.voice_ms += float(args.chunk_ms)
+                    state.voice_ms += float(args.client_chunk_ms)
                     state.silence_ms = 0.0
                 else:
-                    state.silence_ms += float(args.chunk_ms)
+                    state.silence_ms += float(args.client_chunk_ms)
 
                 if state.voice_ms >= float(
-                    args.min_speech_ms
-                ) and state.silence_ms >= float(args.pause_ms):
+                    args.client_min_speech_ms
+                ) and state.silence_ms >= float(args.client_pause_ms):
                     await _send_json(
                         ws,
-                        {"type": "audio.commit", "session_id": session_id},
+                        {"type": "input.turn.commit", "session_id": session_id},
                         send_lock,
                     )
                     logging.info(
@@ -762,15 +745,24 @@ async def run_client(args: argparse.Namespace) -> None:
         logging.info(
             "%s Mic streaming started (%s, chunk=%sms). Press Ctrl+C to stop.",
             _tag("AUDIO", "cyan", use_color),
-            "continuous" if args.continuous_stream else "vad",
-            args.chunk_ms,
+            args.turn_detection_mode,
+            args.client_chunk_ms,
         )
-        if not args.continuous_stream:
+        if args.turn_detection_mode == "client_commit":
             logging.info(
-                "%s VAD settings pause=%sms vad=%.4f.",
+                "%s Client VAD settings pause=%sms threshold=%.4f.",
                 _tag("AUDIO", "cyan", use_color),
-                args.pause_ms,
-                args.vad_threshold,
+                args.client_pause_ms,
+                args.client_vad_threshold,
+            )
+        else:
+            logging.info(
+                "%s Server turn detection threshold=%.2f min_speech=%sms min_silence=%sms pad=%sms.",
+                _tag("AUDIO", "cyan", use_color),
+                args.turn_threshold,
+                args.turn_min_speech_ms,
+                args.turn_min_silence_ms,
+                args.turn_speech_pad_ms,
             )
         logging.info(
             "%s Type /quit then Enter to disconnect", _tag("CMD", "white", use_color)
@@ -861,7 +853,7 @@ def main() -> None:
     parser.add_argument(
         "--output-chunk-sec",
         type=float,
-        default=1.0,
+        default=0.24,
         help="Duration of each output audio chunk in seconds. Lower values can reduce latency but increase risk of underflows.",
     )
     parser.add_argument(
@@ -877,75 +869,77 @@ def main() -> None:
         help="Include transcript text in the same-turn user query (text + audio)",
     )
     parser.add_argument(
-        "--continuous-stream",
+        "--system-prompt",
+        type=str,
+        default=None,
+        help="Optional per-session system prompt override",
+    )
+    parser.add_argument(
+        "--trim-with-vad",
         action="store_true",
-        help="Stream audio continuously and let the server decide when to commit turns",
+        help="Enable VAD trim before server inference",
     )
     parser.add_argument(
-        "--server-auto-commit",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable server-side auto commit (default: enabled)",
+        "--turn-detection-mode",
+        type=str,
+        default="client_commit",
+        choices=["client_commit", "server_vad"],
+        help="Select who owns turn segmentation",
     )
     parser.add_argument(
-        "--server-vad-threshold",
+        "--turn-threshold",
         type=float,
         default=0.5,
-        help="Server-side Silero VAD threshold",
+        help="Server-side turn detector threshold",
     )
     parser.add_argument(
-        "--server-min-speech-ms",
+        "--turn-min-speech-ms",
         type=int,
         default=250,
         help="Server-side minimum speech duration in milliseconds",
     )
     parser.add_argument(
-        "--server-pause-ms",
+        "--turn-min-silence-ms",
         type=int,
         default=500,
         help="Server-side silence duration before auto commit",
     )
     parser.add_argument(
-        "--server-pre-roll-ms",
+        "--turn-speech-pad-ms",
         type=int,
         default=200,
         help="Server-side VAD padding in milliseconds",
     )
-    parser.add_argument(
-        "--server-trim-with-vad",
-        action="store_true",
-        help="Enable server-side VAD trim before inference (default: disabled)",
-    )
 
     parser.add_argument(
-        "--chunk-ms",
+        "--client-chunk-ms",
         type=int,
         default=40,
-        help="Duration of each microphone audio chunk in milliseconds",
+        help="Client chunk duration in milliseconds",
     )
     parser.add_argument(
-        "--pre-roll-ms",
+        "--client-pre-roll-ms",
         type=int,
         default=200,
-        help="Amount of audio to pre-roll before VAD trigger, in milliseconds",
+        help="Client pre-roll before speech trigger in milliseconds",
     )
     parser.add_argument(
-        "--min-speech-ms",
+        "--client-min-speech-ms",
         type=int,
         default=280,
-        help="Minimum duration of speech to consider a valid utterance, in milliseconds",
+        help="Client-side minimum speech duration in milliseconds",
     )
     parser.add_argument(
-        "--pause-ms",
+        "--client-pause-ms",
         type=int,
         default=500,
-        help="Duration of silence to consider the end of an utterance, in milliseconds",
+        help="Client-side silence duration to commit a turn in milliseconds",
     )
     parser.add_argument(
-        "--vad-threshold",
+        "--client-vad-threshold",
         type=float,
         default=0.015,
-        help="Voice activity detection threshold",
+        help="Client-side RMS VAD threshold",
     )
 
     parser.add_argument(
@@ -993,7 +987,7 @@ def main() -> None:
     args = parser.parse_args()
 
     use_color = _should_use_color(args.no_color)
-    _configure_logging(args.log_level, use_color)
+    _configure_logging(args.log_level)
     _interactive_device_setup(args, use_color)
 
     try:
