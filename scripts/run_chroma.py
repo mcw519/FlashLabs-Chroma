@@ -176,7 +176,7 @@ def chroma_inference(
     start_time = time.perf_counter()
     output = model.generate(
         **inputs,
-        max_new_tokens=100,
+        max_new_tokens=1000,
         do_sample=True,
         temperature=0.7,
         top_p=0.9,
@@ -187,7 +187,10 @@ def chroma_inference(
 
     # 3. Decode Audio
     # The model outputs raw tokens; we decode the audio part using the codec
-    audio_values = model.codec_model.decode(output.permute(0, 2, 1)).audio_values
+    audio_codes = output.permute(0, 2, 1)
+    max_token_id = min(2047, int(model.config.vocab_size) - 1)
+    audio_codes = audio_codes.clamp(min=0, max=max_token_id)
+    audio_values = model.codec_model.decode(audio_codes).audio_values
     logging.info("Audio generation completed.")
 
     # Save audio output

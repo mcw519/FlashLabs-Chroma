@@ -58,6 +58,7 @@ class VoicebotWebSocketServer:
     async def _handle_connection(self, websocket) -> None:
         owned_sessions: set[str] = set()
         stream_tasks: dict[str, asyncio.Task] = {}
+        auto_commit_tasks: dict[str, asyncio.Task] = {}
         send_lock = asyncio.Lock()
 
         async def send_json(payload: dict[str, Any]) -> bool:
@@ -67,6 +68,65 @@ class VoicebotWebSocketServer:
                 except ConnectionClosed:
                     return False
             return True
+
+        async def _start_commit(request: dict[str, Any], source: str) -> None:
+            session_id = self._require_session_id(request)
+            task = stream_tasks.get(session_id)
+            if task is not None and not task.done():
+                logger.info(
+                    "commit skipped session_id=%s source=%s reason=active_turn",
+                    session_id,
+                    source,
+                )
+                return
+            if not await send_json(
+                {"type": "response.stream.started", "session_id": session_id}
+            ):
+                return
+            logger.info("commit start session_id=%s source=%s", session_id, source)
+            stream_task = asyncio.create_task(
+                self._handle_audio_commit(
+                    websocket=websocket,
+                    request=request,
+                    send_json=send_json,
+                )
+            )
+            stream_tasks[session_id] = stream_task
+            stream_task.add_done_callback(lambda _: stream_tasks.pop(session_id, None))
+
+        async def _auto_commit_loop(session_id: str) -> None:
+            try:
+                while True:
+                    await asyncio.sleep(0.05)
+                    if session_id not in owned_sessions:
+                        return
+                    try:
+                        config = self.engine.get_session_config(session_id)
+                    except ValueError:
+                        return
+                    if not config.auto_commit:
+                        continue
+                    task = stream_tasks.get(session_id)
+                    if task is not None and not task.done():
+                        continue
+                    ready, reason, trailing_ms, buffered_sec = self.engine.should_auto_commit(
+                        session_id
+                    )
+                    if not ready:
+                        continue
+                    logger.info(
+                        "auto commit trigger session_id=%s reason=%s buffered_sec=%.3f trailing_silence_ms=%.1f",
+                        session_id,
+                        reason,
+                        buffered_sec,
+                        trailing_ms,
+                    )
+                    await _start_commit(
+                        {"type": "audio.commit", "session_id": session_id},
+                        f"auto:{reason}",
+                    )
+            except asyncio.CancelledError:
+                return
 
         try:
             async for raw_message in websocket:
@@ -101,6 +161,11 @@ class VoicebotWebSocketServer:
                         response = self._handle_session_start(request, owned_sessions)
                         if not await send_json(response):
                             break
+                        session_id = response.get("session_id")
+                        if isinstance(session_id, str) and session_id not in auto_commit_tasks:
+                            auto_commit_tasks[session_id] = asyncio.create_task(
+                                _auto_commit_loop(session_id)
+                            )
                     elif event_type == "session.update":
                         response = self._handle_session_update(request)
                         if not await send_json(response):
@@ -110,24 +175,7 @@ class VoicebotWebSocketServer:
                         if not await send_json(response):
                             break
                     elif event_type == "audio.commit":
-                        session_id = self._require_session_id(request)
-                        task = stream_tasks.get(session_id)
-                        if task is not None and not task.done():
-                            task.cancel()
-                        stream_tasks[session_id] = asyncio.create_task(
-                            self._handle_audio_commit(
-                                websocket=websocket,
-                                request=request,
-                                send_json=send_json,
-                            )
-                        )
-                        if not await send_json(
-                            {
-                                "type": "response.stream.started",
-                                "session_id": session_id,
-                            }
-                        ):
-                            break
+                        await _start_commit(request, "client")
                     elif event_type == "response.cancel":
                         response = self._handle_response_cancel(request)
                         if not await send_json(response):
@@ -136,6 +184,10 @@ class VoicebotWebSocketServer:
                         response = self._handle_session_end(request, owned_sessions)
                         if not await send_json(response):
                             break
+                        session_id = response.get("session_id")
+                        task = auto_commit_tasks.pop(session_id, None)
+                        if task is not None:
+                            task.cancel()
                     else:
                         await self._send_error(
                             websocket,
@@ -177,6 +229,10 @@ class VoicebotWebSocketServer:
                 task.cancel()
             if stream_tasks:
                 await asyncio.gather(*stream_tasks.values(), return_exceptions=True)
+            for task in auto_commit_tasks.values():
+                task.cancel()
+            if auto_commit_tasks:
+                await asyncio.gather(*auto_commit_tasks.values(), return_exceptions=True)
             for session_id in owned_sessions:
                 try:
                     self.engine.close_session(session_id)
@@ -193,6 +249,12 @@ class VoicebotWebSocketServer:
             text_mode=config_payload.get("text_mode", "sentence"),
             include_transcript_in_query=config_payload.get("include_transcript_in_query", False),
             system_prompt=config_payload.get("system_prompt"),
+            auto_commit=config_payload.get("auto_commit", True),
+            vad_threshold=config_payload.get("vad_threshold", 0.5),
+            vad_min_speech_ms=config_payload.get("vad_min_speech_ms", 250),
+            vad_min_silence_ms=config_payload.get("vad_min_silence_ms", 500),
+            vad_speech_pad_ms=config_payload.get("vad_speech_pad_ms", 200),
+            trim_with_vad=config_payload.get("trim_with_vad", False),
         )
         self.engine.create_session(session_id, config)
         owned_sessions.add(session_id)
@@ -207,6 +269,12 @@ class VoicebotWebSocketServer:
                 "text_mode": normalized.text_mode,
                 "include_transcript_in_query": normalized.include_transcript_in_query,
                 "system_prompt": normalized.system_prompt,
+                "auto_commit": normalized.auto_commit,
+                "vad_threshold": normalized.vad_threshold,
+                "vad_min_speech_ms": normalized.vad_min_speech_ms,
+                "vad_min_silence_ms": normalized.vad_min_silence_ms,
+                "vad_speech_pad_ms": normalized.vad_speech_pad_ms,
+                "trim_with_vad": normalized.trim_with_vad,
             },
         }
 
@@ -219,6 +287,12 @@ class VoicebotWebSocketServer:
             "output_chunk_sec": updates.get("output_chunk_sec"),
             "text_mode": updates.get("text_mode"),
             "include_transcript_in_query": updates.get("include_transcript_in_query"),
+            "auto_commit": updates.get("auto_commit"),
+            "vad_threshold": updates.get("vad_threshold"),
+            "vad_min_speech_ms": updates.get("vad_min_speech_ms"),
+            "vad_min_silence_ms": updates.get("vad_min_silence_ms"),
+            "vad_speech_pad_ms": updates.get("vad_speech_pad_ms"),
+            "trim_with_vad": updates.get("trim_with_vad"),
         }
         if "system_prompt" in updates:
             update_kwargs["system_prompt"] = updates.get("system_prompt")
@@ -234,6 +308,12 @@ class VoicebotWebSocketServer:
                 "text_mode": normalized.text_mode,
                 "include_transcript_in_query": normalized.include_transcript_in_query,
                 "system_prompt": normalized.system_prompt,
+                "auto_commit": normalized.auto_commit,
+                "vad_threshold": normalized.vad_threshold,
+                "vad_min_speech_ms": normalized.vad_min_speech_ms,
+                "vad_min_silence_ms": normalized.vad_min_silence_ms,
+                "vad_speech_pad_ms": normalized.vad_speech_pad_ms,
+                "trim_with_vad": normalized.trim_with_vad,
             },
         }
 
@@ -283,6 +363,14 @@ class VoicebotWebSocketServer:
                 )
 
             async for event in self.engine.commit_turn(session_id):
+                event_type = getattr(event, "type", None)
+                if event_type in {"response.done", "response.cancelled"}:
+                    logger.info(
+                        "turn completed session_id=%s turn_id=%s event_type=%s",
+                        session_id,
+                        getattr(event, "turn_id", None),
+                        event_type,
+                    )
                 if not await send_json(event_to_dict(event)):
                     return
         except asyncio.CancelledError:

@@ -29,6 +29,7 @@ except Exception as exc:  # pragma: no cover
 
 try:
     import websockets
+    from websockets.exceptions import ConnectionClosedOK
 except Exception as exc:  # pragma: no cover
     raise SystemExit(
         "Missing dependency: websockets. Install with `python -m pip install websockets`."
@@ -496,6 +497,12 @@ async def run_client(args: argparse.Namespace) -> None:
                     "output_chunk_sec": args.output_chunk_sec,
                     "text_mode": args.text_mode,
                     "include_transcript_in_query": args.include_transcript_in_query,
+                    "auto_commit": args.server_auto_commit,
+                    "vad_threshold": args.server_vad_threshold,
+                    "vad_min_speech_ms": args.server_min_speech_ms,
+                    "vad_min_silence_ms": args.server_pause_ms,
+                    "vad_speech_pad_ms": args.server_pre_roll_ms,
+                    "trim_with_vad": args.server_trim_with_vad,
                 },
             },
             send_lock,
@@ -611,6 +618,28 @@ async def run_client(args: argparse.Namespace) -> None:
                     continue
                 rms = _rms_from_pcm16le(chunk)
                 is_voice = rms >= args.vad_threshold
+                if args.continuous_stream:
+                    if state.generating and is_voice and not state.barge_in_sent:
+                        await _send_json(
+                            ws,
+                            {"type": "response.cancel", "session_id": session_id},
+                            send_lock,
+                        )
+                        state.barge_in_sent = True
+                        logging.info(
+                            "%s Barge-in detected: sent response.cancel",
+                            _tag("INTERRUPT", "yellow", use_color),
+                        )
+                    await _send_json(
+                        ws,
+                        {
+                            "type": "audio.append",
+                            "session_id": session_id,
+                            "audio_b64": base64.b64encode(chunk).decode("ascii"),
+                        },
+                        send_lock,
+                    )
+                    continue
 
                 if not state.in_turn:
                     pre_roll.append(chunk)
@@ -731,12 +760,18 @@ async def run_client(args: argparse.Namespace) -> None:
             playback_thread.start()
 
         logging.info(
-            "%s Mic streaming started (chunk=%sms pause=%sms vad=%.4f). Press Ctrl+C to stop.",
+            "%s Mic streaming started (%s, chunk=%sms). Press Ctrl+C to stop.",
             _tag("AUDIO", "cyan", use_color),
+            "continuous" if args.continuous_stream else "vad",
             args.chunk_ms,
-            args.pause_ms,
-            args.vad_threshold,
         )
+        if not args.continuous_stream:
+            logging.info(
+                "%s VAD settings pause=%sms vad=%.4f.",
+                _tag("AUDIO", "cyan", use_color),
+                args.pause_ms,
+                args.vad_threshold,
+            )
         logging.info(
             "%s Type /quit then Enter to disconnect", _tag("CMD", "white", use_color)
         )
@@ -755,6 +790,12 @@ async def run_client(args: argparse.Namespace) -> None:
                     continue
                 exc = task.exception()
                 if exc is not None and not isinstance(exc, asyncio.CancelledError):
+                    if isinstance(exc, ConnectionClosedOK):
+                        logging.info(
+                            "%s Connection closed cleanly",
+                            _tag("CONNECT", "yellow", use_color),
+                        )
+                        continue
                     raise exc
             stop_event.set()
             io_stop.set()
@@ -834,6 +875,46 @@ def main() -> None:
         "--include-transcript-in-query",
         action="store_true",
         help="Include transcript text in the same-turn user query (text + audio)",
+    )
+    parser.add_argument(
+        "--continuous-stream",
+        action="store_true",
+        help="Stream audio continuously and let the server decide when to commit turns",
+    )
+    parser.add_argument(
+        "--server-auto-commit",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable server-side auto commit (default: enabled)",
+    )
+    parser.add_argument(
+        "--server-vad-threshold",
+        type=float,
+        default=0.5,
+        help="Server-side Silero VAD threshold",
+    )
+    parser.add_argument(
+        "--server-min-speech-ms",
+        type=int,
+        default=250,
+        help="Server-side minimum speech duration in milliseconds",
+    )
+    parser.add_argument(
+        "--server-pause-ms",
+        type=int,
+        default=500,
+        help="Server-side silence duration before auto commit",
+    )
+    parser.add_argument(
+        "--server-pre-roll-ms",
+        type=int,
+        default=200,
+        help="Server-side VAD padding in milliseconds",
+    )
+    parser.add_argument(
+        "--server-trim-with-vad",
+        action="store_true",
+        help="Enable server-side VAD trim before inference (default: disabled)",
     )
 
     parser.add_argument(

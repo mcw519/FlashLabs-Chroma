@@ -261,6 +261,8 @@ class _EngineAudioStreamer(BaseStreamer):
             "%sstreamer decode_frames frame_count=%s", self.log_prefix, len(frames)
         )
         audio_codes = torch.stack(frames).to(self.model.device)
+        max_token_id = 2047  # align to SGLang version
+        audio_codes = audio_codes.clamp(min=0, max=max_token_id)
         audio_values = self.model.codec_model.decode(
             audio_codes.transpose(0, 1).unsqueeze(0)
         ).audio_values
@@ -438,6 +440,12 @@ class StreamingVoicebotEngine:
             output_chunk_sec = kwargs.get("output_chunk_sec")
             text_mode = kwargs.get("text_mode")
             include_transcript_in_query = kwargs.get("include_transcript_in_query")
+            auto_commit = kwargs.get("auto_commit")
+            vad_threshold = kwargs.get("vad_threshold")
+            vad_min_speech_ms = kwargs.get("vad_min_speech_ms")
+            vad_min_silence_ms = kwargs.get("vad_min_silence_ms")
+            vad_speech_pad_ms = kwargs.get("vad_speech_pad_ms")
+            trim_with_vad = kwargs.get("trim_with_vad")
             system_prompt = kwargs.get("system_prompt", _UNSET)
             merged = SessionConfig(
                 speaker=config.speaker if speaker is None else speaker,
@@ -452,6 +460,30 @@ class StreamingVoicebotEngine:
                     config.include_transcript_in_query
                     if include_transcript_in_query is None
                     else include_transcript_in_query
+                ),
+                auto_commit=(
+                    config.auto_commit if auto_commit is None else auto_commit
+                ),
+                vad_threshold=(
+                    config.vad_threshold if vad_threshold is None else vad_threshold
+                ),
+                vad_min_speech_ms=(
+                    config.vad_min_speech_ms
+                    if vad_min_speech_ms is None
+                    else vad_min_speech_ms
+                ),
+                vad_min_silence_ms=(
+                    config.vad_min_silence_ms
+                    if vad_min_silence_ms is None
+                    else vad_min_silence_ms
+                ),
+                vad_speech_pad_ms=(
+                    config.vad_speech_pad_ms
+                    if vad_speech_pad_ms is None
+                    else vad_speech_pad_ms
+                ),
+                trim_with_vad=(
+                    config.trim_with_vad if trim_with_vad is None else trim_with_vad
                 ),
                 system_prompt=(
                     config.system_prompt if system_prompt is _UNSET else system_prompt
@@ -475,6 +507,12 @@ class StreamingVoicebotEngine:
                 text_mode=config.text_mode,
                 include_transcript_in_query=config.include_transcript_in_query,
                 system_prompt=config.system_prompt,
+                auto_commit=config.auto_commit,
+                vad_threshold=config.vad_threshold,
+                vad_min_speech_ms=config.vad_min_speech_ms,
+                vad_min_silence_ms=config.vad_min_silence_ms,
+                vad_speech_pad_ms=config.vad_speech_pad_ms,
+                trim_with_vad=config.trim_with_vad,
             )
 
     def set_pending_user_text(self, session_id: str, text: str | None) -> None:
@@ -520,6 +558,44 @@ class StreamingVoicebotEngine:
         state = self._get_session(session_id)
         with state.lock:
             return bytes(state.audio_buffer)
+
+    def should_auto_commit(self, session_id: str) -> tuple[bool, str, float, float]:
+        state = self._get_session(session_id)
+        with state.lock:
+            config = self._normalize_config(state.config)
+            audio_bytes = bytes(state.audio_buffer)
+
+        if not config.auto_commit:
+            return False, "disabled", 0.0, 0.0
+
+        if not audio_bytes:
+            return False, "empty", 0.0, 0.0
+
+        buffered_samples = len(audio_bytes) // 2
+        buffered_sec = buffered_samples / float(INPUT_SAMPLE_RATE)
+        if len(audio_bytes) >= self.max_input_bytes:
+            return True, "max_buffer", 0.0, buffered_sec
+
+        audio_np = pcm16le_bytes_to_float32_mono(audio_bytes)
+        audio_tensor = torch.from_numpy(audio_np)
+        speech_timestamps = get_speech_timestamps(
+            audio_tensor,
+            self._vad_model,
+            sampling_rate=INPUT_SAMPLE_RATE,
+            threshold=config.vad_threshold,
+            min_speech_duration_ms=config.vad_min_speech_ms,
+            min_silence_duration_ms=config.vad_min_silence_ms,
+            speech_pad_ms=config.vad_speech_pad_ms,
+        )
+        if not speech_timestamps:
+            return False, "no_speech", 0.0, buffered_sec
+
+        last_end = int(speech_timestamps[-1]["end"])
+        trailing_samples = max(0, buffered_samples - last_end)
+        trailing_silence_ms = (trailing_samples / float(INPUT_SAMPLE_RATE)) * 1000.0
+        if trailing_silence_ms >= config.vad_min_silence_ms:
+            return True, "silence", trailing_silence_ms, buffered_sec
+        return False, "speech_active", trailing_silence_ms, buffered_sec
 
     def cancel_response(self, session_id: str) -> None:
         logger.info("cancel_response requested session_id=%s", session_id)
@@ -619,7 +695,8 @@ class StreamingVoicebotEngine:
             _shape(audio_16k),
             raw_seconds,
         )
-        audio_16k = self._trim_with_vad(audio_16k)
+        if config.trim_with_vad:
+            audio_16k = self._trim_with_vad(audio_16k)
         trimmed_seconds = audio_16k.shape[-1] / INPUT_SAMPLE_RATE
         logger.debug(
             "commit_turn vad trimmed session_id=%s turn_id=%s trimmed_seconds=%.3f",
@@ -1216,6 +1293,14 @@ class StreamingVoicebotEngine:
             default=False,
         )
         system_prompt = self._normalize_session_prompt(config.system_prompt)
+        auto_commit = self._coerce_bool(config.auto_commit, default=True)
+        vad_threshold = float(config.vad_threshold)
+        if not (0.0 < vad_threshold <= 1.0):
+            vad_threshold = 0.5
+        vad_min_speech_ms = max(0, int(config.vad_min_speech_ms))
+        vad_min_silence_ms = max(0, int(config.vad_min_silence_ms))
+        vad_speech_pad_ms = max(0, int(config.vad_speech_pad_ms))
+        trim_with_vad = self._coerce_bool(config.trim_with_vad, default=False)
 
         normalized = SessionConfig(
             speaker=speaker,
@@ -1224,6 +1309,12 @@ class StreamingVoicebotEngine:
             text_mode=text_mode,
             include_transcript_in_query=include_transcript_in_query,
             system_prompt=system_prompt,
+            auto_commit=auto_commit,
+            vad_threshold=vad_threshold,
+            vad_min_speech_ms=vad_min_speech_ms,
+            vad_min_silence_ms=vad_min_silence_ms,
+            vad_speech_pad_ms=vad_speech_pad_ms,
+            trim_with_vad=trim_with_vad,
         )
         logger.debug("normalize_config output=%s", normalized)
         return normalized

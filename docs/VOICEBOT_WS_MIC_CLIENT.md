@@ -51,6 +51,21 @@ python scripts/run_voicebot_ws_mic_client.py \
   --speaker scarlett_johansson
 ```
 
+Continuous streaming mode (server auto-commit):
+
+```bash
+python scripts/run_voicebot_ws_mic_client.py \
+  --url ws://127.0.0.1:8765 \
+  --speaker scarlett_johansson \
+  --continuous-stream \
+  --server-auto-commit \
+  --server-vad-threshold 0.5 \
+  --server-min-speech-ms 250 \
+  --server-pause-ms 500 \
+  --server-pre-roll-ms 200 \
+  --server-trim-with-vad
+```
+
 At startup, the client will prompt for:
 - Microphone device
 - Speaker device (or `none` to disable playback)
@@ -65,6 +80,7 @@ What the mic client does:
 - Sends `audio.commit` automatically when pause is detected
 - Plays streamed response audio locally
 - Sends `response.cancel` automatically on barge-in
+- With `--continuous-stream`, sends continuous audio and relies on server auto-commit
 
 ## 5. Client Parameters
 
@@ -76,6 +92,13 @@ Session/output:
 - `--output-chunk-sec`: response chunk cadence
 - `--text-mode`: `none|sentence|final`
 - `--include-transcript-in-query`: include transcript in same-turn query (`text + audio`, default off)
+- `--continuous-stream`: stream audio continuously and let server auto-commit turns
+- `--server-auto-commit`: enable/disable server-side auto commit (default on)
+- `--server-vad-threshold`: server-side Silero VAD threshold
+- `--server-min-speech-ms`: server-side minimum speech duration
+- `--server-pause-ms`: server-side silence duration before auto commit
+- `--server-pre-roll-ms`: server-side VAD padding
+- `--server-trim-with-vad`: enable server-side VAD trim before inference
 
 VAD/turn segmentation:
 
@@ -84,6 +107,8 @@ VAD/turn segmentation:
 - `--min-speech-ms`: minimum speech duration to commit (default `280`)
 - `--pause-ms`: silence duration threshold to commit (default `500`)
 - `--vad-threshold`: RMS threshold (default `0.015`)
+
+When `--continuous-stream` is enabled, client VAD no longer sends `audio.commit`; the server uses its own VAD to segment turns.
 
 Audio devices:
 

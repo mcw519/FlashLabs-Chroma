@@ -14,6 +14,12 @@ class SessionConfig:
     text_mode: TextMode = "sentence"
     include_transcript_in_query: bool = False
     system_prompt: str | None = None
+    auto_commit: bool = True
+    vad_threshold: float = 0.5
+    vad_min_speech_ms: int = 250
+    vad_min_silence_ms: int = 500
+    vad_speech_pad_ms: int = 200
+    trim_with_vad: bool = False
 
 
 @dataclass(slots=True)

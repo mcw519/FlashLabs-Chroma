@@ -45,6 +45,12 @@ class FakeEngine:
             text_mode=config.text_mode,
             include_transcript_in_query=config.include_transcript_in_query,
             system_prompt=normalized_prompt,
+            auto_commit=config.auto_commit,
+            vad_threshold=config.vad_threshold,
+            vad_min_speech_ms=config.vad_min_speech_ms,
+            vad_min_silence_ms=config.vad_min_silence_ms,
+            vad_speech_pad_ms=config.vad_speech_pad_ms,
+            trim_with_vad=config.trim_with_vad,
         )
         self.sessions[session_id] = {"config": normalized, "audio": bytearray()}
 
@@ -75,6 +81,34 @@ class FakeEngine:
                 else kwargs.get("include_transcript_in_query")
             ),
             system_prompt=system_prompt,
+            auto_commit=(
+                config.auto_commit if kwargs.get("auto_commit") is None else kwargs.get("auto_commit")
+            ),
+            vad_threshold=(
+                config.vad_threshold
+                if kwargs.get("vad_threshold") is None
+                else kwargs.get("vad_threshold")
+            ),
+            vad_min_speech_ms=(
+                config.vad_min_speech_ms
+                if kwargs.get("vad_min_speech_ms") is None
+                else kwargs.get("vad_min_speech_ms")
+            ),
+            vad_min_silence_ms=(
+                config.vad_min_silence_ms
+                if kwargs.get("vad_min_silence_ms") is None
+                else kwargs.get("vad_min_silence_ms")
+            ),
+            vad_speech_pad_ms=(
+                config.vad_speech_pad_ms
+                if kwargs.get("vad_speech_pad_ms") is None
+                else kwargs.get("vad_speech_pad_ms")
+            ),
+            trim_with_vad=(
+                config.trim_with_vad
+                if kwargs.get("trim_with_vad") is None
+                else kwargs.get("trim_with_vad")
+            ),
         )
         self.sessions[session_id]["updates"] = kwargs
 
@@ -92,6 +126,9 @@ class FakeEngine:
 
     def get_session_config(self, session_id):
         return self.sessions[session_id]["config"]
+
+    def should_auto_commit(self, session_id):
+        return False, "disabled", 0.0, 0.0
 
     async def commit_turn(self, session_id):
         turn_id = "1"

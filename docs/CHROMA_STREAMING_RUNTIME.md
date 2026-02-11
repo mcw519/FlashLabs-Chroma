@@ -22,7 +22,7 @@
 - 用途：建立 session 與初始 config
 - 範例：
 ```json
-{"type":"session.start","session_id":"demo-1","config":{"speaker":"scarlett_johansson","memory_turns":6,"output_chunk_sec":0.5,"text_mode":"sentence","include_transcript_in_query":false,"system_prompt":"You are a concise support bot."}}
+{"type":"session.start","session_id":"demo-1","config":{"speaker":"scarlett_johansson","memory_turns":6,"output_chunk_sec":0.5,"text_mode":"sentence","include_transcript_in_query":false,"auto_commit":true,"vad_threshold":0.5,"vad_min_speech_ms":250,"vad_min_silence_ms":500,"vad_speech_pad_ms":200,"trim_with_vad":false,"system_prompt":"You are a concise support bot."}}
 ```
 
 2. `audio.append`
@@ -41,6 +41,14 @@
   - `false`：維持目前行為，`transcript` 只進 memory，不進本回合 query。
   - `true`：本回合 query 會用 `text + audio` 一起送入 thinker/backbone。
 - 若 server 啟用 `--server-asr-model`，`audio.commit.transcript` 會被忽略，改由 server 端用當前 turn 的 audio buffer 轉寫。
+
+### 2.1.1 Server-side auto commit
+
+- `auto_commit`（預設 `true`）：允許 server 端用 Silero VAD 自動判斷 turn 邊界，即使 client 沒有送 `audio.commit`。
+- `vad_threshold` / `vad_min_speech_ms` / `vad_min_silence_ms` / `vad_speech_pad_ms`：控制 server 端 Silero VAD 行為。
+- `trim_with_vad`（預設 `false`）：是否在推論前用 VAD 裁切音訊（裁掉前後靜音）。
+- 若持續輸入超過 `max_input_seconds`，server 會強制 commit。
+ - 啟用時 `audio.commit` 變成可選；client 可改成連續送 `audio.append`。
 ```json
 {"type":"audio.commit","session_id":"demo-1","transcript":"optional"}
 ```
