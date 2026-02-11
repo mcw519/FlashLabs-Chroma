@@ -86,6 +86,15 @@ V2 is **breaking** and replaces previous event names.
 - `response.done`: includes `metrics` (`ttfs_ms`, `chunk_gap_ms`, throughput fields, etc.).
 - `error`: shape `{type, session_id, code, message, details?}`.
 
+### 7.2 Server Session Log Artifacts
+- Logs are written under `logs/YYYY-MM-DD/<session_id>/`.
+- If `session_id` contains filesystem-unsafe chars, the directory name is sanitized (`[^A-Za-z0-9._-]` -> `_`).
+- User audio per committed turn is saved as `user_0001.wav`, `user_0002.wav`, ... (16kHz PCM16 mono).
+- Assistant audio per turn is saved as `bot_0001.wav`, `bot_0002.wav`, ... (24kHz PCM16 mono) when audio exists.
+- Turn records are appended to `conversation_log.json` in the same directory.
+- `conversation_log.json` stores per-turn `user`/`assistant` text, audio filenames, `event`, `metrics`, and optional `error`.
+- File persistence can be disabled by starting server with `--disable-session-log`.
+
 ## 8. Typical Flow
 1. `session.open`
 2. `input.audio.append` x N

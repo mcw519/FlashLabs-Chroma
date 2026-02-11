@@ -68,6 +68,8 @@ python scripts/run_voicebot_ws_mic_client.py \
 | `--server-asr-language` | `string` | `""` | ASR 語言提示（可選）。 |
 | `--server-asr-device` | `auto\|cpu\|cuda` | `auto` | ASR 執行裝置。 |
 | `--server-asr-timeout-sec` | `float` | `1.2` | 每次 commit 的 ASR timeout。 |
+| `--session-log-root` | `string` | `None` | session log 根目錄（預設為 `<repo>/logs`）。 |
+| `--disable-session-log` | `flag` | `false` | 完全關閉 session log 檔案落地（音訊 + `conversation_log.json`）。 |
 
 ### 5.2 Mic Client 會送到 Session Config 的參數（`scripts/run_voicebot_ws_mic_client.py`）
 
@@ -106,3 +108,10 @@ python scripts/run_voicebot_ws_mic_client.py \
 
 ## 6. 執行時指令
 - 輸入 `/quit` 後 Enter，client 會送 `session.close` 並斷線。
+
+## 7. Server Session Logs
+- Server 會把 log 存在 `logs/YYYY-MM-DD/<session_id>/`。
+- user 每回合音訊會分段存成 `user_0001.wav`、`user_0002.wav`...（16kHz PCM16 單聲道）。
+- model 生成音訊會分段存成 `bot_0001.wav`、`bot_0002.wav`...（24kHz PCM16 單聲道，該回合有輸出才會有檔案）。
+- 同一資料夾內會有 `conversation_log.json`，記錄每回合對話與 metrics。
+- 若要關閉上述落地，啟動 server 時加上 `--disable-session-log`。

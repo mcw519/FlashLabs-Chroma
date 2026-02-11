@@ -86,6 +86,15 @@ V2 為**破壞性升級**，已取代舊事件命名。
 - `response.done`：包含 `metrics`（如 `ttfs_ms`、`chunk_gap_ms`、throughput 欄位）。
 - `error`：格式 `{type, session_id, code, message, details?}`。
 
+### 7.2 Server Session Log 落地檔案
+- log 會寫到 `logs/YYYY-MM-DD/<session_id>/`。
+- 若 `session_id` 含有檔案系統不安全字元，資料夾名稱會先正規化（`[^A-Za-z0-9._-]` 會改成 `_`）。
+- 每個 commit turn 的使用者音訊會存成 `user_0001.wav`、`user_0002.wav`...（16kHz PCM16 單聲道）。
+- 每個 turn 的模型音訊會存成 `bot_0001.wav`、`bot_0002.wav`...（24kHz PCM16 單聲道，該回合有輸出才會有檔案）。
+- 同資料夾會追加 `conversation_log.json`。
+- `conversation_log.json` 會記錄每回合 `user`/`assistant` 文字、音訊檔名、`event`、`metrics`，以及可選的 `error`。
+- 若啟動 server 時帶 `--disable-session-log`，上述落地會完全關閉。
+
 ## 8. 典型流程
 1. `session.open`
 2. `input.audio.append` x N

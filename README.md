@@ -254,6 +254,7 @@ python scripts/run_voicebot_ws.py \
   --use-half-precision \
   --bot-config example/bot_configs/support_agent.toml \
   --prompt-speaker scarlett_johansson \
+  --session-log-root ./logs \
   --host 0.0.0.0 \
   --port 8765
 ```
@@ -293,6 +294,13 @@ Per-session persona override:
 `include_transcript_in_query` defaults to `false` (current behavior): transcript is stored in memory only.
 Set it to `true` to include transcript in the same turn's user query (`text + audio`).
 When `--server-asr-model` is enabled on server, `input.turn.commit.transcript` from client is ignored.
+
+Server session logs are persisted automatically (or set custom root with `--session-log-root`):
+- Root: `logs/YYYY-MM-DD/<session_id>/` (`<session_id>` is path-sanitized if needed).
+- User turn audio: `user_0001.wav`, `user_0002.wav`, ... (16kHz PCM16 mono).
+- Model output audio: `bot_0001.wav`, `bot_0002.wav`, ... (24kHz PCM16 mono, only when output exists).
+- Conversation + metrics: `conversation_log.json` (per-turn user/bot text, event status, metrics, and optional error details).
+- Disable file persistence with `--disable-session-log`.
 
 Microphone streaming client (local mic -> WebSocket):
 ```bash

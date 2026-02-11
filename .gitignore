@@ -210,3 +210,4 @@ __marimo__/
 pretrained_models/
 generated_response.wav
 .gradio/
+logs/

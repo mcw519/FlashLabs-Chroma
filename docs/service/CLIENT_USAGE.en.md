@@ -68,6 +68,8 @@ python scripts/run_voicebot_ws_mic_client.py \
 | `--server-asr-language` | `string` | `""` | Optional ASR language hint. |
 | `--server-asr-device` | `auto\|cpu\|cuda` | `auto` | ASR runtime device. |
 | `--server-asr-timeout-sec` | `float` | `1.2` | ASR timeout per committed turn. |
+| `--session-log-root` | `string` | `None` | Root directory for persisted session logs (default: `<repo>/logs`). |
+| `--disable-session-log` | `flag` | `false` | Disable persisted session logs (audio + `conversation_log.json`). |
 
 ### 5.2 Mic Client Session Flags (`scripts/run_voicebot_ws_mic_client.py`)
 
@@ -110,3 +112,10 @@ These flags are local client behavior and are not sent to server config.
 
 ## 6. Runtime Commands
 - Type `/quit` and press Enter to send `session.close` and disconnect.
+
+## 7. Server Session Logs
+- Server writes logs under `logs/YYYY-MM-DD/<session_id>/`.
+- User turn audio is split into `user_0001.wav`, `user_0002.wav`, ... (16kHz PCM16 mono).
+- Assistant generated audio is split into `bot_0001.wav`, `bot_0002.wav`, ... (24kHz PCM16 mono, when output exists).
+- Turn transcript/metadata is appended to `conversation_log.json` in the same folder.
+- Use `--disable-session-log` on server startup to turn this off completely.

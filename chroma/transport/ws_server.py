@@ -4,7 +4,11 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import uuid
+import wave
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
 import websockets
@@ -26,6 +30,153 @@ def _clip_text(text: str | None, max_chars: int = 220) -> str:
     if len(clipped) <= max_chars:
         return clipped
     return clipped[: max_chars - 3] + "..."
+
+
+def _now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _today_folder() -> str:
+    return datetime.now().astimezone().date().isoformat()
+
+
+def _safe_session_dirname(session_id: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", session_id).strip("._")
+    return cleaned or "session"
+
+
+def _write_pcm16_wav(path: Path, *, sample_rate: int, audio_bytes: bytes) -> None:
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(audio_bytes)
+
+
+class _SessionLogWriter:
+    def __init__(self, root_dir: Path, session_id: str):
+        self._root_dir = root_dir
+        self._session_id = session_id
+        self._safe_session_id = _safe_session_dirname(session_id)
+        self._session_dir = self._root_dir / _today_folder() / self._safe_session_id
+        self._session_dir.mkdir(parents=True, exist_ok=True)
+        self._conversation_path = self._session_dir / "conversation_log.json"
+        self._conversation: dict[str, Any] = self._load_or_init()
+        self._turn_index = self._resolve_next_turn_index()
+        if self._safe_session_id != self._session_id:
+            logger.warning(
+                "session log path sanitized session_id=%s safe_session_id=%s",
+                self._session_id,
+                self._safe_session_id,
+            )
+
+    @property
+    def session_dir(self) -> Path:
+        return self._session_dir
+
+    def record_turn(
+        self,
+        *,
+        source: str,
+        turn_id: str | None,
+        user_audio_bytes: bytes,
+        user_text: str | None,
+        user_text_source: str,
+        assistant_audio_bytes: bytes,
+        assistant_text: str | None,
+        assistant_event: str,
+        metrics: dict[str, float],
+        error: dict[str, Any] | None = None,
+    ) -> None:
+        self._turn_index += 1
+        turn_index = self._turn_index
+        user_audio_name = f"user_{turn_index:04d}.wav"
+        user_audio_path = self._session_dir / user_audio_name
+        _write_pcm16_wav(user_audio_path, sample_rate=16000, audio_bytes=user_audio_bytes)
+
+        assistant_audio_name: str | None = None
+        if assistant_audio_bytes:
+            assistant_audio_name = f"bot_{turn_index:04d}.wav"
+            assistant_audio_path = self._session_dir / assistant_audio_name
+            _write_pcm16_wav(
+                assistant_audio_path,
+                sample_rate=24000,
+                audio_bytes=assistant_audio_bytes,
+            )
+
+        entry: dict[str, Any] = {
+            "turn_index": turn_index,
+            "turn_id": turn_id,
+            "source": source,
+            "created_at": _now_iso(),
+            "user": {
+                "text": user_text,
+                "text_source": user_text_source,
+                "audio_file": user_audio_name,
+                "audio_bytes": len(user_audio_bytes),
+            },
+            "assistant": {
+                "event": assistant_event,
+                "text": assistant_text,
+                "audio_file": assistant_audio_name,
+                "audio_bytes": len(assistant_audio_bytes),
+            },
+            "metrics": metrics,
+        }
+        if error is not None:
+            entry["error"] = error
+
+        turns = self._conversation.setdefault("turns", [])
+        if not isinstance(turns, list):
+            turns = []
+            self._conversation["turns"] = turns
+        turns.append(entry)
+        self._conversation["updated_at"] = _now_iso()
+        self.flush()
+
+    def flush(self) -> None:
+        self._conversation_path.write_text(
+            json.dumps(self._conversation, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _load_or_init(self) -> dict[str, Any]:
+        if self._conversation_path.exists():
+            try:
+                loaded = json.loads(self._conversation_path.read_text(encoding="utf-8"))
+            except Exception:
+                logger.exception(
+                    "session log read failed path=%s", self._conversation_path
+                )
+            else:
+                if isinstance(loaded, dict):
+                    return loaded
+        now = _now_iso()
+        initial = {
+            "session_id": self._session_id,
+            "safe_session_id": self._safe_session_id,
+            "created_at": now,
+            "updated_at": now,
+            "turns": [],
+        }
+        self._conversation_path.write_text(
+            json.dumps(initial, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return initial
+
+    def _resolve_next_turn_index(self) -> int:
+        turns = self._conversation.get("turns", [])
+        if not isinstance(turns, list) or not turns:
+            return 0
+        max_index = 0
+        for item in turns:
+            if not isinstance(item, dict):
+                continue
+            raw_index = item.get("turn_index")
+            if isinstance(raw_index, int):
+                max_index = max(max_index, raw_index)
+        return max_index
 
 
 class RequestError(ValueError):
@@ -62,6 +213,8 @@ class VoicebotWebSocketServer:
         max_message_size: int = 8 * 1024 * 1024,
         asr_transcriber: AudioTranscriber | None = None,
         server_asr_timeout_sec: float = 1.2,
+        session_log_root: str | Path | None = None,
+        session_log_enabled: bool = True,
     ) -> None:
         _configure_transport_logging()
         self.engine = engine
@@ -70,6 +223,17 @@ class VoicebotWebSocketServer:
         self.max_message_size = max_message_size
         self.asr_transcriber = asr_transcriber
         self.server_asr_timeout_sec = max(0.05, float(server_asr_timeout_sec))
+        self.session_log_enabled = bool(session_log_enabled)
+        repo_root = Path(__file__).resolve().parents[2]
+        if session_log_root is None:
+            self.session_log_root = repo_root / "logs"
+        else:
+            self.session_log_root = Path(session_log_root)
+        if self.session_log_enabled:
+            self.session_log_root.mkdir(parents=True, exist_ok=True)
+            logger.info("session logging enabled root=%s", self.session_log_root)
+        else:
+            logger.info("session logging disabled")
 
     async def serve_forever(self) -> None:
         logger.info("server start url=ws://%s:%s", self.host, self.port)
@@ -85,6 +249,7 @@ class VoicebotWebSocketServer:
         owned_sessions: set[str] = set()
         stream_tasks: dict[str, asyncio.Task] = {}
         auto_commit_tasks: dict[str, asyncio.Task] = {}
+        session_logs: dict[str, _SessionLogWriter] = {}
         send_lock = asyncio.Lock()
 
         async def send_json(payload: dict[str, Any]) -> bool:
@@ -114,6 +279,8 @@ class VoicebotWebSocketServer:
                 self._handle_audio_commit(
                     request=request,
                     send_json=send_json,
+                    source=source,
+                    session_logs=session_logs,
                 )
             )
             stream_tasks[session_id] = stream_task
@@ -183,6 +350,19 @@ class VoicebotWebSocketServer:
                         if not await send_json(response):
                             break
                         session_id = response.get("session_id")
+                        if (
+                            self.session_log_enabled
+                            and isinstance(session_id, str)
+                            and session_id not in session_logs
+                        ):
+                            try:
+                                session_logs[session_id] = _SessionLogWriter(
+                                    self.session_log_root, session_id
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "session log init failed session_id=%s", session_id
+                                )
                         if isinstance(session_id, str) and session_id not in auto_commit_tasks:
                             auto_commit_tasks[session_id] = asyncio.create_task(
                                 _auto_commit_loop(session_id)
@@ -207,6 +387,8 @@ class VoicebotWebSocketServer:
                         task = auto_commit_tasks.pop(session_id, None)
                         if task is not None:
                             task.cancel()
+                        if isinstance(session_id, str):
+                            session_logs.pop(session_id, None)
                     else:
                         await self._send_error(
                             ErrorEvent(
@@ -304,16 +486,42 @@ class VoicebotWebSocketServer:
         self,
         request: dict[str, Any],
         send_json: Callable[[dict[str, Any]], Awaitable[bool]],
+        source: str,
+        session_logs: dict[str, _SessionLogWriter],
     ) -> None:
         session_id = request.get("session_id")
+        turn_id: str | None = None
+        user_audio_bytes = b""
+        user_text: str | None = None
+        user_text_source = "none"
+        assistant_audio_bytes = bytearray()
+        assistant_text: str | None = None
+        assistant_event = "stream_incomplete"
+        metrics: dict[str, float] = {}
+        turn_error: dict[str, Any] | None = None
+        session_logger: _SessionLogWriter | None = None
         try:
             session_id = self._require_session_id(request)
+            if self.session_log_enabled:
+                session_logger = session_logs.get(session_id)
+                if session_logger is None:
+                    try:
+                        session_logger = _SessionLogWriter(self.session_log_root, session_id)
+                    except Exception:
+                        logger.exception("session log init failed session_id=%s", session_id)
+                    else:
+                        session_logs[session_id] = session_logger
+
+            if session_logger is not None:
+                user_audio_bytes = self.engine.get_buffered_audio(session_id)
             transcript = request.get("transcript")
             if transcript is not None and not isinstance(transcript, str):
                 raise ValueError("Field 'transcript' must be string")
             server_transcript = await self._transcribe_for_commit(session_id)
             if server_transcript:
                 self.engine.set_pending_user_text(session_id, server_transcript)
+                user_text = server_transcript
+                user_text_source = "server_asr"
                 logger.info(
                     "server_asr transcript accepted session_id=%s length=%s",
                     session_id,
@@ -326,6 +534,8 @@ class VoicebotWebSocketServer:
                 )
             elif self.asr_transcriber is None and transcript:
                 self.engine.set_pending_user_text(session_id, transcript)
+                user_text = transcript
+                user_text_source = "client_transcript"
                 logger.info(
                     "user.input session_id=%s source=client text=%s",
                     session_id,
@@ -339,6 +549,53 @@ class VoicebotWebSocketServer:
 
             async for event in self.engine.commit_turn(session_id):
                 event_type = getattr(event, "type", None)
+                event_turn_id = getattr(event, "turn_id", None)
+                if isinstance(event_turn_id, str):
+                    turn_id = event_turn_id
+
+                if session_logger is None:
+                    pass
+                elif event_type == "response.audio.delta":
+                    audio_b64 = getattr(event, "audio_b64", None)
+                    if isinstance(audio_b64, str) and audio_b64:
+                        try:
+                            chunk = base64.b64decode(audio_b64, validate=True)
+                        except Exception:
+                            logger.warning(
+                                "session log skipped invalid response audio chunk session_id=%s turn_id=%s",
+                                session_id,
+                                turn_id,
+                            )
+                        else:
+                            assistant_audio_bytes.extend(chunk)
+                elif event_type == "response.text.delta":
+                    text_delta = getattr(event, "text", None)
+                    if isinstance(text_delta, str) and text_delta:
+                        assistant_text = text_delta
+                elif event_type == "response.done":
+                    assistant_event = "response.done"
+                    final_text = getattr(event, "text", None)
+                    if isinstance(final_text, str) and final_text:
+                        assistant_text = final_text
+                    raw_metrics = getattr(event, "metrics", None)
+                    if isinstance(raw_metrics, dict):
+                        normalized_metrics: dict[str, float] = {}
+                        for key, value in raw_metrics.items():
+                            if isinstance(value, bool):
+                                continue
+                            if isinstance(value, (int, float)):
+                                normalized_metrics[str(key)] = float(value)
+                        metrics = normalized_metrics
+                if event_type == "response.cancelled":
+                    assistant_event = "response.cancelled"
+                elif event_type == "error":
+                    assistant_event = "error"
+                    turn_error = {
+                        "code": getattr(event, "code", "engine_error"),
+                        "message": getattr(event, "message", "Engine returned error"),
+                        "details": getattr(event, "details", None),
+                    }
+
                 if event_type in {"response.done", "response.cancelled"}:
                     logger.info(
                         "turn completed session_id=%s turn_id=%s event_type=%s",
@@ -349,12 +606,15 @@ class VoicebotWebSocketServer:
                 if not await send_json(event_to_dict(event)):
                     return
         except asyncio.CancelledError:
+            assistant_event = "response.cancelled"
             if isinstance(session_id, str):
                 self.engine.cancel_response(session_id)
             raise
         except ConnectionClosed:
             return
         except Exception as exc:
+            assistant_event = "error"
+            turn_error = {"code": "audio_commit_failed", "message": str(exc)}
             logger.exception("commit failed session_id=%s", request.get("session_id"))
             await send_json(
                 event_to_dict(
@@ -365,6 +625,27 @@ class VoicebotWebSocketServer:
                     )
                 )
             )
+        finally:
+            if session_logger is not None:
+                try:
+                    session_logger.record_turn(
+                        source=source,
+                        turn_id=turn_id,
+                        user_audio_bytes=user_audio_bytes,
+                        user_text=user_text,
+                        user_text_source=user_text_source,
+                        assistant_audio_bytes=bytes(assistant_audio_bytes),
+                        assistant_text=assistant_text,
+                        assistant_event=assistant_event,
+                        metrics=metrics,
+                        error=turn_error,
+                    )
+                except Exception:
+                    logger.exception(
+                        "session log write failed session_id=%s turn_id=%s",
+                        session_id,
+                        turn_id,
+                    )
 
     async def _transcribe_for_commit(self, session_id: str) -> str | None:
         if self.asr_transcriber is None:

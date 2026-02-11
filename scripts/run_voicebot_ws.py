@@ -61,6 +61,17 @@ def parse_args() -> argparse.Namespace:
         default=1.2,
         help="Timeout for server-side ASR per committed turn",
     )
+    parser.add_argument(
+        "--session-log-root",
+        type=str,
+        default=None,
+        help="Root directory for persisted session logs (default: <repo>/logs)",
+    )
+    parser.add_argument(
+        "--disable-session-log",
+        action="store_true",
+        help="Disable persisted session logs (audio chunks + conversation_log.json)",
+    )
     return parser.parse_args()
 
 
@@ -96,6 +107,8 @@ def main() -> None:
         max_message_size=args.max_message_size,
         asr_transcriber=asr_transcriber,
         server_asr_timeout_sec=args.server_asr_timeout_sec,
+        session_log_root=args.session_log_root,
+        session_log_enabled=not args.disable_session_log,
     )
     asyncio.run(server.serve_forever())
 
