@@ -398,7 +398,7 @@ class StreamingVoicebotEngine:
         max_new_tokens: int,
         max_text_new_tokens: int,
         temperature: float,
-        top_p: float,
+        top_k: int,
         output_chunk_sec: float = 0.24,
         decode_mode: str = "full_turn",
         overlap_frames: int = 2,
@@ -413,7 +413,7 @@ class StreamingVoicebotEngine:
         _configure_engine_logging()
         logger.info(
             "engine init start model_path=%s half_precision=%s max_new_tokens=%s max_text_new_tokens=%s "
-            "temperature=%s top_p=%s output_chunk_sec=%s decode_mode=%s overlap_frames=%s "
+            "temperature=%s top_k=%s output_chunk_sec=%s decode_mode=%s overlap_frames=%s "
             "default_speaker=%s enable_text=%s max_sessions=%s "
             "max_input_seconds=%s warmup=%s bot_config_path=%s has_custom_system_prompt=%s",
             model_path,
@@ -421,7 +421,7 @@ class StreamingVoicebotEngine:
             max_new_tokens,
             max_text_new_tokens,
             temperature,
-            top_p,
+            top_k,
             output_chunk_sec,
             decode_mode,
             overlap_frames,
@@ -443,7 +443,7 @@ class StreamingVoicebotEngine:
         self.max_new_tokens = max_new_tokens
         self.max_text_new_tokens = max_text_new_tokens
         self.temperature = temperature
-        self.top_p = top_p
+        self.top_k = max(1, int(top_k))
         self.default_output_chunk_sec = output_chunk_sec
         self.decode_mode = (
             decode_mode if decode_mode in {"full_turn", "overlap_stream"} else "full_turn"
@@ -1106,7 +1106,7 @@ class StreamingVoicebotEngine:
                     max_new_tokens=self.max_new_tokens,
                     do_sample=True,
                     temperature=self.temperature,
-                    top_p=self.top_p,
+                    top_k=self.top_k,
                     use_cache=True,
                     streamer=streamer,
                     stopping_criteria=StoppingCriteriaList(
@@ -1462,7 +1462,7 @@ class StreamingVoicebotEngine:
             max_new_tokens=self.max_text_new_tokens,
             do_sample=True,
             temperature=self.temperature,
-            top_p=self.top_p,
+            top_k=self.top_k,
             use_cache=False,
             # use_cache=True,
         )

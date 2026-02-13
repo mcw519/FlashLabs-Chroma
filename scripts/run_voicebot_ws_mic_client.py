@@ -89,6 +89,15 @@ class TurnState:
     barge_in_sent: bool = False
 
 
+def _is_barge_in_enabled(mode: str, has_local_playback: bool) -> bool:
+    normalized = (mode or "auto").strip().lower()
+    if normalized == "off":
+        return False
+    if normalized == "force":
+        return True
+    return not has_local_playback
+
+
 class _PlaybackBuffer:
     def __init__(
         self,
@@ -487,6 +496,10 @@ async def run_client(args: argparse.Namespace) -> None:
             blocksize=output_chunk_frames,
             device=_resolve_device(args.output_device),
         )
+    barge_in_enabled = _is_barge_in_enabled(
+        args.barge_in_mode,
+        has_local_playback=output_stream is not None,
+    )
 
     async with websockets.connect(ws_url, max_size=8 * 1024 * 1024) as ws:
 
@@ -560,6 +573,7 @@ async def run_client(args: argparse.Namespace) -> None:
                     )
                 elif event_type == "response.started":
                     state.generating = True
+                    state.barge_in_sent = False
                     if output_stream is not None:
                         playback_queue.put(None)
                     logging.info(
@@ -643,7 +657,12 @@ async def run_client(args: argparse.Namespace) -> None:
                 rms = _rms_from_pcm16le(chunk)
                 is_voice = rms >= args.client_vad_threshold
                 if args.turn_detection_mode == "server_vad":
-                    if state.generating and is_voice and not state.barge_in_sent:
+                    if (
+                        barge_in_enabled
+                        and state.generating
+                        and is_voice
+                        and not state.barge_in_sent
+                    ):
                         await _send_json(
                             ws,
                             {"type": "response.cancel", "session_id": session_id},
@@ -670,7 +689,11 @@ async def run_client(args: argparse.Namespace) -> None:
                     if not is_voice:
                         continue
 
-                    if state.generating and not state.barge_in_sent:
+                    if (
+                        barge_in_enabled
+                        and state.generating
+                        and not state.barge_in_sent
+                    ):
                         await _send_json(
                             ws,
                             {"type": "response.cancel", "session_id": session_id},
@@ -805,6 +828,14 @@ async def run_client(args: argparse.Namespace) -> None:
                 args.turn_min_silence_ms,
                 args.turn_speech_pad_ms,
             )
+        if args.turn_detection_mode == "server_vad":
+            logging.info(
+                "%s Barge-in mode=%s enabled=%s (local_playback=%s)",
+                _tag("INTERRUPT", "cyan", use_color),
+                args.barge_in_mode,
+                barge_in_enabled,
+                output_stream is not None,
+            )
         logging.info(
             "%s Type /quit then Enter to disconnect", _tag("CMD", "white", use_color)
         )
@@ -900,7 +931,7 @@ def main() -> None:
     parser.add_argument(
         "--text-mode",
         type=str,
-        default="sentence",
+        default="final",
         choices=["none", "sentence", "final"],
         help="When to send partial transcript text from the current turn. 'sentence' sends completed sentences, 'final' sends only the final transcript at the end of the turn, and 'none' disables transcript updates.",
     )
@@ -926,6 +957,13 @@ def main() -> None:
         default="client_commit",
         choices=["client_commit", "server_vad"],
         help="Select who owns turn segmentation",
+    )
+    parser.add_argument(
+        "--barge-in-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "off", "force"],
+        help="Barge-in cancel policy: auto disables cancel when local playback is on; off never cancels; force always cancels.",
     )
     parser.add_argument(
         "--turn-threshold",

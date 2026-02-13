@@ -70,7 +70,7 @@ class ChromaRealtimeEngine:
         max_new_tokens: int,
         max_text_new_tokens: int,
         temperature: float,
-        top_p: float,
+        top_k: int,
         output_chunk_sec: float,
         decode_mode: str,
         overlap_frames: int,
@@ -87,7 +87,7 @@ class ChromaRealtimeEngine:
             max_new_tokens=max_new_tokens,
             max_text_new_tokens=max_text_new_tokens,
             temperature=temperature,
-            top_p=top_p,
+            top_k=top_k,
             output_chunk_sec=output_chunk_sec,
             decode_mode=decode_mode,
             overlap_frames=overlap_frames,
@@ -227,7 +227,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--max-text-new-tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=0.2)
-    parser.add_argument("--top-p", type=float, default=0.9)
+    parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--output-chunk-sec", type=float, default=0.24)
     parser.add_argument(
         "--decode-mode",
@@ -263,7 +263,7 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
         max_text_new_tokens=args.max_text_new_tokens,
         temperature=args.temperature,
-        top_p=args.top_p,
+        top_k=args.top_k,
         output_chunk_sec=args.output_chunk_sec,
         decode_mode=args.decode_mode,
         overlap_frames=args.overlap_frames,

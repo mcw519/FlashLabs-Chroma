@@ -24,11 +24,11 @@ def parse_args() -> argparse.Namespace:
         help="Path to bot config (.json/.toml) with system_prompt",
     )
     parser.add_argument("--prompt-speaker", type=str, default="scarlett_johansson")
-    parser.add_argument("--max-new-tokens", type=int, default=1000)
+    parser.add_argument("--max-new-tokens", type=int, default=384)
     parser.add_argument("--max-text-new-tokens", type=int, default=64)
-    parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--top-p", type=float, default=0.9)
-    parser.add_argument("--output-chunk-sec", type=float, default=0.24)
+    parser.add_argument("--temperature", type=float, default=0.4)
+    parser.add_argument("--top-k", type=int, default=50)
+    parser.add_argument("--output-chunk-sec", type=float, default=0.48)
     parser.add_argument(
         "--decode-mode",
         type=str,
@@ -98,7 +98,7 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
         max_text_new_tokens=args.max_text_new_tokens,
         temperature=args.temperature,
-        top_p=args.top_p,
+        top_k=args.top_k,
         output_chunk_sec=args.output_chunk_sec,
         decode_mode=args.decode_mode,
         overlap_frames=args.overlap_frames,
