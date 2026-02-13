@@ -93,3 +93,67 @@ def test_prepare_inputs_uses_audio_first_query_shape() -> None:
     assert conv[0]["role"] == "system"
     assert conv[1]["role"] == "user"
     assert conv[1]["content"][0]["type"] == "audio"
+
+
+def test_commit_turn_adds_user_memory_after_inputs_prepared() -> None:
+    from chroma.engine.streaming_engine import StreamingVoicebotEngine
+
+    class _MinimalCommitModel:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(
+                codec_config=SimpleNamespace(frame_rate=12.5),
+                decoder_config=SimpleNamespace(audio_num_codebooks=1),
+                codebook_eos_token_id=0,
+            )
+            self._text_streamer = None
+
+        def generate(self, **kwargs) -> None:
+            streamer = kwargs["streamer"]
+            streamer.end()
+
+    engine = StreamingVoicebotEngine.__new__(StreamingVoicebotEngine)
+    engine.model = _MinimalCommitModel()
+    engine.enable_text = False
+    engine.max_new_tokens = 16
+    engine.max_text_new_tokens = 8
+    engine.temperature = 0.7
+    engine.top_p = 0.9
+    engine.decode_mode = "full_turn"
+    engine.overlap_frames = 2
+    engine._generate_lock = threading.Lock()
+    engine._sessions_lock = threading.Lock()
+
+    state = _SessionState(config=SessionConfig(include_transcript_in_query=False))
+    state.pending_user_text = "hello from transcript"
+    state.audio_buffer.extend(b"\x00\x00" * 1600)  # 100ms at 16kHz PCM16 mono
+    engine._sessions = {"s1": state}
+
+    memory_sizes_seen: list[int] = []
+
+    def _prepare_inputs_stub(
+        self,
+        audio_np,
+        speaker,
+        state,
+        session_id,
+        turn_id,
+        query_text,
+        include_transcript_in_query,
+    ):
+        memory_sizes_seen.append(len(state.memory))
+        return {}
+
+    engine._prepare_inputs = MethodType(_prepare_inputs_stub, engine)
+
+    async def _drain_events() -> None:
+        async for _event in engine.commit_turn("s1"):
+            pass
+
+    import asyncio
+
+    asyncio.run(_drain_events())
+
+    assert memory_sizes_seen == [0]
+    assert len(state.memory) == 1
+    assert state.memory[0].role == "user"
+    assert state.memory[0].text == "hello from transcript"

@@ -1,34 +1,54 @@
 # Chroma WS Client Usage (V2)
 
-## 1. Start Server
+## 1. Prerequisites
+- Project dependencies installed (recommended: `uv sync`)
+- Server can access Chroma model (default: `FlashLabs/Chroma-4B`)
+- Microphone client requires working `sounddevice` audio devices
+
+## 2. Fastest End-to-End Setup
+
+### 2.1 Terminal A: start server
 ```bash
 python scripts/run_voicebot_ws.py \
   --use-half-precision \
+  --decode-mode full_turn \
   --prompt-speaker scarlett_johansson \
   --host 0.0.0.0 \
   --port 8765
 ```
 
-## 2. Start Microphone Client
+### 2.2 Terminal B: start microphone client
 ```bash
 python scripts/run_voicebot_ws_mic_client.py \
   --url ws://127.0.0.1:8765 \
   --speaker scarlett_johansson
 ```
 
-## 3. Turn Detection Modes
-### Client-owned turn segmentation
+### 2.3 Disconnect cleanly
+- Type `/quit` in the client and press Enter (sends `session.close`).
+
+## 3. Common Startup Recipes
+
+### 3.1 Lower-latency streaming (`overlap_stream`)
+Server:
 ```bash
-python scripts/run_voicebot_ws_mic_client.py \
-  --turn-detection-mode client_commit \
-  --client-vad-threshold 0.015 \
-  --client-min-speech-ms 280 \
-  --client-pause-ms 500
+python scripts/run_voicebot_ws.py \
+  --decode-mode overlap_stream \
+  --overlap-frames 2 \
+  --output-chunk-sec 0.20
 ```
 
-### Server-owned turn segmentation
+Client:
 ```bash
 python scripts/run_voicebot_ws_mic_client.py \
+  --url ws://127.0.0.1:8765 \
+  --output-chunk-sec 0.20
+```
+
+### 3.2 Server-owned turn detection (`server_vad`)
+```bash
+python scripts/run_voicebot_ws_mic_client.py \
+  --url ws://127.0.0.1:8765 \
   --turn-detection-mode server_vad \
   --turn-threshold 0.5 \
   --turn-min-speech-ms 250 \
@@ -36,86 +56,138 @@ python scripts/run_voicebot_ws_mic_client.py \
   --turn-speech-pad-ms 200
 ```
 
-## 4. Client Flags
-- Session: `--session-id`, `--speaker`, `--memory-turns`, `--output-chunk-sec`
-- Prompt/response: `--text-mode`, `--include-transcript-in-query`, `--system-prompt`
-- Server inference: `--trim-with-vad`, `--turn-*`
-- Client VAD/input: `--client-*`
-- Audio devices/playback: `--input-device`, `--output-device`, `--disable-playback`
+### 3.3 Client-owned turn detection (`client_commit`)
+```bash
+python scripts/run_voicebot_ws_mic_client.py \
+  --url ws://127.0.0.1:8765 \
+  --turn-detection-mode client_commit \
+  --client-vad-threshold 0.015 \
+  --client-min-speech-ms 280 \
+  --client-pause-ms 500
+```
 
-## 5. Detailed Parameter Reference
+### 3.4 Disable text output and persisted logs
+```bash
+python scripts/run_voicebot_ws.py \
+  --disable-text \
+  --disable-session-log
+```
 
-### 5.1 Server Script (`scripts/run_voicebot_ws.py`)
+### 3.5 Enable server-side ASR
+```bash
+python scripts/run_voicebot_ws.py \
+  --server-asr-model openai/whisper-small \
+  --server-asr-language en \
+  --server-asr-timeout-sec 1.2
+```
 
-| Flag | Type | Default | Notes |
-| --- | --- | --- | --- |
-| `--model-path` | `string` | `None` | Local model path. If omitted, uses default HF model id. |
-| `--bot-config` | `string` | `None` | JSON/TOML config; can provide startup `system_prompt`. |
-| `--prompt-speaker` | `string` | `scarlett_johansson` | Default speaker used when session does not override `speaker`. |
-| `--max-new-tokens` | `int` | `1000` | Max generated audio token steps per turn. |
-| `--max-text-new-tokens` | `int` | `64` | Max tokens for thinker text branch. |
-| `--temperature` | `float` | `0.7` | Sampling temperature for generation. |
-| `--top-p` | `float` | `0.9` | Nucleus sampling threshold. |
-| `--output-chunk-sec` | `float` | `0.24` | Default chunk duration if session omits `output_chunk_sec`. |
-| `--use-half-precision` | `flag` | `false` | Requests fp16 when CUDA is available. |
-| `--disable-text` | `flag` | `false` | Disables thinker text output events. |
-| `--max-sessions` | `int` | `3` | Maximum active sessions in engine. |
-| `--host` | `string` | `0.0.0.0` | WebSocket bind host. |
-| `--port` | `int` | `8765` | WebSocket bind port. |
-| `--max-message-size` | `int` | `8388608` | Max WS frame size (bytes). |
-| `--warmup` | `flag` | `false` | Runs one warmup inference at startup. |
-| `--server-asr-model` | `string` | `""` | Enables server-side ASR for commit transcript. |
-| `--server-asr-language` | `string` | `""` | Optional ASR language hint. |
-| `--server-asr-device` | `auto\|cpu\|cuda` | `auto` | ASR runtime device. |
-| `--server-asr-timeout-sec` | `float` | `1.2` | ASR timeout per committed turn. |
-| `--session-log-root` | `string` | `None` | Root directory for persisted session logs (default: `<repo>/logs`). |
-| `--disable-session-log` | `flag` | `false` | Disable persisted session logs (audio + `conversation_log.json`). |
+## 4. Parameter Map
 
-### 5.2 Mic Client Session Flags (`scripts/run_voicebot_ws_mic_client.py`)
+### 4.1 Server (`scripts/run_voicebot_ws.py`)
+Main knobs:
+- inference: `--max-new-tokens`, `--temperature`, `--top-p`
+- streaming: `--decode-mode`, `--overlap-frames`, `--output-chunk-sec`
+- service: `--host`, `--port`, `--max-message-size`, `--max-sessions`
+- features: `--disable-text`, `--warmup`, `--server-asr-*`, `--disable-session-log`
 
-These flags map directly into `session.open.config`.
+### 4.2 Mic client flags mapped into session config
+- `--speaker` -> `speaker`
+- `--memory-turns` -> `memory_turns`
+- `--output-chunk-sec` -> `output_chunk_sec`
+- `--text-mode` -> `text_mode`
+- `--include-transcript-in-query` -> `include_transcript_in_query`
+- `--system-prompt` -> `system_prompt`
+- `--trim-with-vad` -> `trim_with_vad`
+- `--turn-detection-mode` / `--turn-*` -> `turn_detection.*`
 
-| Flag | Config Field | Type | Default | Notes |
-| --- | --- | --- | --- | --- |
-| `--speaker` | `speaker` | `string` | `scarlett_johansson` | Persona speaker for prompt style. |
-| `--memory-turns` | `memory_turns` | `int` | `6` | `<0` normalized to `0` by server. |
-| `--output-chunk-sec` | `output_chunk_sec` | `float` | `0.24` | `<=0` normalized to server default. |
-| `--text-mode` | `text_mode` | `enum` | `sentence` | `none`, `sentence`, `final`. |
-| `--include-transcript-in-query` | `include_transcript_in_query` | `bool` | `false` | Adds transcript text into same-turn model query. |
-| `--system-prompt` | `system_prompt` | `string\|null` | `None` | Trimmed; must be non-empty if provided. |
-| `--trim-with-vad` | `trim_with_vad` | `bool` | `false` | Enables pre-inference VAD trimming. |
-| `--turn-detection-mode` | `turn_detection.mode` | `enum` | `client_commit` | Turn owner selector. |
-| `--turn-threshold` | `turn_detection.threshold` | `float` | `0.5` | Used when mode is `server_vad`. |
-| `--turn-min-speech-ms` | `turn_detection.min_speech_ms` | `int` | `250` | Used when mode is `server_vad`. |
-| `--turn-min-silence-ms` | `turn_detection.min_silence_ms` | `int` | `500` | Used when mode is `server_vad`. |
-| `--turn-speech-pad-ms` | `turn_detection.speech_pad_ms` | `int` | `200` | Used when mode is `server_vad`. |
+Transcript timing:
+- `include_transcript_in_query=false`: transcript is not used in the same-turn query; it is added to short-term memory for later turns.
+- `include_transcript_in_query=true`: transcript is included in same-turn query (`text + audio`).
 
-### 5.3 Mic Client Local Input/Playback Flags
+### 4.3 Mic client local-only behavior (not sent to server)
+- VAD/send loop: `--client-*`
+- device selection: `--input-device`, `--output-device`
+- playback smoothing: `--jitter-buffer-ms`, `--crossfade-ms`
+- UX/logging: `--no-device-prompt`, `--no-color`, `--log-level`
 
-These flags are local client behavior and are not sent to server config.
+## 5. Raw WebSocket Integration Example (Python)
 
-| Flag | Type | Default | Notes |
-| --- | --- | --- | --- |
-| `--client-chunk-ms` | `int` | `40` | Mic capture chunk size in ms. |
-| `--client-pre-roll-ms` | `int` | `200` | Pre-roll buffer before client VAD start. |
-| `--client-min-speech-ms` | `int` | `280` | Client-side commit threshold (mode=`client_commit`). |
-| `--client-pause-ms` | `int` | `500` | Silence threshold to commit (mode=`client_commit`). |
-| `--client-vad-threshold` | `float` | `0.015` | RMS voice activity threshold (mode=`client_commit`). |
-| `--input-device` | `string` | `None` | Input device name or numeric index. |
-| `--output-device` | `string` | `None` | Output device name or numeric index. |
-| `--disable-playback` | `flag` | `false` | Disable local playback. |
-| `--jitter-buffer-ms` | `int` | `300` | Playback jitter buffer size. |
-| `--crossfade-ms` | `float` | `8.0` | Chunk boundary smoothing (`0` to `10`). |
-| `--no-device-prompt` | `flag` | `false` | Skips interactive device picker. |
-| `--no-color` | `flag` | `false` | Disables colored local tags. |
-| `--log-level` | `string` | `INFO` | Local logger level. |
+```python
+import asyncio
+import base64
+import json
+import wave
+import websockets
 
-## 6. Runtime Commands
-- Type `/quit` and press Enter to send `session.close` and disconnect.
 
-## 7. Server Session Logs
-- Server writes logs under `logs/YYYY-MM-DD/<session_id>/`.
-- User turn audio is split into `user_0001.wav`, `user_0002.wav`, ... (16kHz PCM16 mono).
-- Assistant generated audio is split into `bot_0001.wav`, `bot_0002.wav`, ... (24kHz PCM16 mono, when output exists).
-- Turn transcript/metadata is appended to `conversation_log.json` in the same folder.
-- Use `--disable-session-log` on server startup to turn this off completely.
+def load_pcm16_16k_mono_b64(path: str) -> str:
+    with wave.open(path, "rb") as wf:
+        assert wf.getnchannels() == 1
+        assert wf.getsampwidth() == 2
+        assert wf.getframerate() == 16000
+        pcm = wf.readframes(wf.getnframes())
+    return base64.b64encode(pcm).decode("ascii")
+
+
+async def main():
+    session_id = "demo-s1"
+    audio_b64 = load_pcm16_16k_mono_b64("example/make_taco.wav")
+
+    async with websockets.connect("ws://127.0.0.1:8765") as ws:
+        await ws.send(json.dumps({
+            "type": "session.open",
+            "session_id": session_id,
+            "config": {
+                "speaker": "scarlett_johansson",
+                "text_mode": "final",
+                "turn_detection": {"mode": "client_commit"}
+            }
+        }))
+        print(await ws.recv())  # session.opened
+
+        await ws.send(json.dumps({
+            "type": "input.audio.append",
+            "session_id": session_id,
+            "audio_b64": audio_b64
+        }))
+        print(await ws.recv())  # input.audio.accepted
+
+        await ws.send(json.dumps({
+            "type": "input.turn.commit",
+            "session_id": session_id,
+            "transcript": "please summarize this audio"
+        }))
+
+        while True:
+            msg = json.loads(await ws.recv())
+            print(msg["type"])
+            if msg["type"] in {"response.done", "response.cancelled", "error"}:
+                break
+
+        await ws.send(json.dumps({"type": "session.close", "session_id": session_id}))
+        print(await ws.recv())  # session.closed
+
+
+asyncio.run(main())
+```
+
+## 6. Barge-In Behavior
+To interrupt ongoing generation, send:
+```json
+{"type":"response.cancel","session_id":"..."}
+```
+If cancellation succeeds, you will get `response.cancelled`.
+
+## 7. Troubleshooting
+- `invalid_base64`
+  - `audio_b64` is not valid base64 or not encoded PCM bytes.
+- `audio_too_short`
+  - Effective speech after trim is too short; increase speech duration or tune VAD.
+- Audio events arrive but no sound playback
+  - Ensure playback is enabled and `--output-device` is correct.
+- `Max sessions limit reached`
+  - Increase server `--max-sessions` or close stale sessions.
+
+## 8. Related Docs
+- Service protocol: `docs/service/STREAMING_SERVICE_SPEC.en.md`
+- Model runtime algorithm: `docs/model/S2S_PIPELINE.en.md`

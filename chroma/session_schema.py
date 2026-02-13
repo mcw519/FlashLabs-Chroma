@@ -21,7 +21,7 @@ class SessionConfigV2:
     speaker: str = "scarlett_johansson"
     memory_turns: int = 6
     output_chunk_sec: float = 0.24
-    text_mode: TextMode = "sentence"
+    text_mode: TextMode = "final" # "sentence"
     include_transcript_in_query: bool = False
     system_prompt: str | None = None
     trim_with_vad: bool = False

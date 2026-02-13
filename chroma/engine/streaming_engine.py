@@ -99,7 +99,7 @@ class AbortOnCancelCriteria(StoppingCriteria):
         super().__init__()
         self._cancel_event = cancel_event
 
-    def __call__(
+    def __call__(  # type: ignore
         self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs
     ) -> bool:
         return self._cancel_event.is_set()
@@ -129,15 +129,24 @@ class _SessionState:
     vad_active_speech_start_sample: int | None = None
     vad_last_speech_end_sample: int | None = None
     vad_total_speech_samples: int = 0
+    # Marks that we've observed speech in the current server-side VAD turn.
+    vad_turn_started: bool = False
+
+
+_SENTINEL_END = "END"
 
 
 class _EngineAudioStreamer(BaseStreamer):
+    """Streamer supporting full-turn and overlap-window decode modes."""
+
     def __init__(
         self,
         model,
         frames_per_chunk: int,
         cancel_event: threading.Event,
         on_audio_chunk,
+        decode_mode: str = "full_turn",
+        overlap_frames: int = 2,
         log_prefix: str = "",
     ):
         self.model = model
@@ -145,15 +154,38 @@ class _EngineAudioStreamer(BaseStreamer):
         self.cancel_event = cancel_event
         self.on_audio_chunk = on_audio_chunk
         self.log_prefix = log_prefix
+        self.decode_mode = (
+            decode_mode if decode_mode in {"full_turn", "overlap_stream"} else "full_turn"
+        )
+        self.overlap_frames = max(0, int(overlap_frames))
         self.eos_token_id = model.config.codebook_eos_token_id
         self.num_codebooks = model.config.decoder_config.audio_num_codebooks
         self._buffer: list[torch.Tensor] = []
+        self._all_frames: list[torch.Tensor] = []
+        self._overlap_history: list[torch.Tensor] = []
         self._closed = False
+        self._decode_queue: queue.Queue[list[torch.Tensor] | str] | None = None
+        self._decode_thread: threading.Thread | None = None
+        if self.decode_mode == "overlap_stream":
+            # Queue for handing frame batches to the background decode thread.
+            self._decode_queue = queue.Queue()
+            self._decode_thread = threading.Thread(
+                target=self._decode_loop, daemon=True
+            )
+            self._decode_thread.start()
+        # Collect thinker text token IDs produced during generation.
+        self._text_token_ids: list[int] = []
+        self._im_end_token_id: int = int(
+            getattr(model.config, "im_end_token_id", -1)
+        )
+        self._text_eos = False
         logger.debug(
-            "%sstreamer initialized frames_per_chunk=%s num_codebooks=%s",
+            "%sstreamer initialized frames_per_chunk=%s num_codebooks=%s decode_mode=%s overlap_frames=%s",
             self.log_prefix,
             frames_per_chunk,
             self.num_codebooks,
+            self.decode_mode,
+            self.overlap_frames,
         )
 
     def put(self, value) -> None:
@@ -209,14 +241,19 @@ class _EngineAudioStreamer(BaseStreamer):
             self.end()
             return
         self._buffer.append(tokens)
+        if self.decode_mode == "full_turn":
+            self._all_frames.append(tokens)
         logger.debug(
             "%sstreamer buffered frame_count=%s/%s",
             self.log_prefix,
             len(self._buffer),
             self.frames_per_chunk,
         )
-        if len(self._buffer) >= self.frames_per_chunk:
-            self._emit_frames(self.frames_per_chunk)
+        if (
+            self.decode_mode == "overlap_stream"
+            and len(self._buffer) >= self.frames_per_chunk
+        ):
+            self._enqueue_frames(self.frames_per_chunk)
 
     def end(self) -> None:
         if self._closed:
@@ -227,27 +264,111 @@ class _EngineAudioStreamer(BaseStreamer):
             self.log_prefix,
             len(self._buffer),
         )
-        if self._buffer:
-            self._emit_frames(len(self._buffer))
-            self._buffer.clear()
+        if self.decode_mode == "full_turn":
+            if self.cancel_event.is_set():
+                return
+            if self._all_frames:
+                audio_np = self._decode_frames(self._all_frames)
+                if audio_np.size > 0:
+                    self.on_audio_chunk(audio_np)
+            return
 
-    def _emit_frames(self, count: int) -> None:
-        logger.debug("%sstreamer emit_frames count=%s", self.log_prefix, count)
-        frames = self._buffer[:count]
-        del self._buffer[:count]
-        audio_np = self._decode_frames(frames)
-        if audio_np.size == 0:
+        if self._buffer:
+            self._enqueue_frames(len(self._buffer))
+        if self._decode_queue is not None:
+            self._decode_queue.put(_SENTINEL_END)
+        if self._decode_thread is not None:
+            self._decode_thread.join(timeout=10.0)
+            if self._decode_thread.is_alive():
+                logger.warning(
+                    "%sdecode thread did not finish within timeout", self.log_prefix
+                )
+
+    def put_text_token(self, token_ids: torch.Tensor) -> None:
+        """Collect a thinker text token ID produced during generation."""
+        if self._text_eos:
+            return
+        token_id = int(token_ids[0].item()) if token_ids.ndim >= 1 else int(token_ids.item())
+        if token_id == self._im_end_token_id:
+            self._text_eos = True
             logger.debug(
-                "%sstreamer decoded empty audio chunk; skip emit", self.log_prefix
+                "%sstreamer text EOS received, total_text_tokens=%s",
+                self.log_prefix,
+                len(self._text_token_ids),
             )
             return
+        self._text_token_ids.append(token_id)
         logger.debug(
-            "%sstreamer emit audio_chunk shape=%s samples=%s",
+            "%sstreamer collected text token id=%s total=%s",
             self.log_prefix,
-            _shape(audio_np),
-            audio_np.shape[-1] if audio_np.ndim > 0 else 0,
+            token_id,
+            len(self._text_token_ids),
         )
-        self.on_audio_chunk(audio_np)
+
+    def get_text_token_ids(self) -> list[int]:
+        """Return the collected thinker text token IDs."""
+        return self._text_token_ids
+
+    def _enqueue_frames(self, count: int) -> None:
+        """Move *count* buffered frames to the decode queue (non-blocking)."""
+        frames = self._buffer[:count]
+        del self._buffer[:count]
+        if not frames:
+            return
+        if self._decode_queue is None:
+            return
+        self._decode_queue.put(frames)
+        logger.debug(
+            "%sstreamer enqueued %s frames for decode", self.log_prefix, len(frames)
+        )
+
+    # -- background decode thread -------------------------------------------
+
+    def _decode_loop(self) -> None:
+        """Drain the decode queue and emit audio chunks."""
+        if self._decode_queue is None:
+            return
+        while True:
+            item = self._decode_queue.get()
+            if item is _SENTINEL_END:
+                break
+            if self.cancel_event.is_set():
+                continue
+            new_frames: list[torch.Tensor] = item
+            if self.overlap_frames > 0 and self._overlap_history:
+                frames = self._overlap_history + new_frames
+                overlap_prefix_frames = len(self._overlap_history)
+            else:
+                frames = new_frames
+                overlap_prefix_frames = 0
+            audio_np = self._decode_frames(frames)
+            if audio_np.size == 0:
+                logger.debug(
+                    "%sstreamer decoded empty audio chunk; skip emit", self.log_prefix
+                )
+                continue
+            if overlap_prefix_frames > 0:
+                total_frames = len(frames)
+                total_samples = audio_np.shape[-1]
+                prefix_samples = int(
+                    round((overlap_prefix_frames / float(total_frames)) * total_samples)
+                )
+                if prefix_samples >= total_samples:
+                    continue
+                audio_np = audio_np[..., prefix_samples:]
+                if audio_np.size == 0:
+                    continue
+            logger.debug(
+                "%sstreamer emit audio_chunk shape=%s samples=%s",
+                self.log_prefix,
+                _shape(audio_np),
+                audio_np.shape[-1] if audio_np.ndim > 0 else 0,
+            )
+            self.on_audio_chunk(audio_np)
+            if self.overlap_frames > 0:
+                self._overlap_history = frames[-self.overlap_frames :]
+            else:
+                self._overlap_history = []
 
     @torch.no_grad()
     def _decode_frames(self, frames: list[torch.Tensor]) -> np.ndarray:
@@ -255,7 +376,9 @@ class _EngineAudioStreamer(BaseStreamer):
             "%sstreamer decode_frames frame_count=%s", self.log_prefix, len(frames)
         )
         audio_codes = torch.stack(frames).to(self.model.device)
-        max_token_id = min(2047, int(getattr(self.model.config, "vocab_size", 2048)) - 1)
+        max_token_id = min(
+            2047, int(getattr(self.model.config, "vocab_size", 2048)) - 1
+        )
         audio_codes = audio_codes.clamp(min=0, max=max_token_id)
         audio_values = self.model.codec_model.decode(
             audio_codes.transpose(0, 1).unsqueeze(0)
@@ -277,6 +400,8 @@ class StreamingVoicebotEngine:
         temperature: float,
         top_p: float,
         output_chunk_sec: float = 0.24,
+        decode_mode: str = "full_turn",
+        overlap_frames: int = 2,
         default_speaker: str = "scarlett_johansson",
         enable_text: bool = True,
         max_sessions: int = 3,
@@ -288,7 +413,8 @@ class StreamingVoicebotEngine:
         _configure_engine_logging()
         logger.info(
             "engine init start model_path=%s half_precision=%s max_new_tokens=%s max_text_new_tokens=%s "
-            "temperature=%s top_p=%s output_chunk_sec=%s default_speaker=%s enable_text=%s max_sessions=%s "
+            "temperature=%s top_p=%s output_chunk_sec=%s decode_mode=%s overlap_frames=%s "
+            "default_speaker=%s enable_text=%s max_sessions=%s "
             "max_input_seconds=%s warmup=%s bot_config_path=%s has_custom_system_prompt=%s",
             model_path,
             use_half_precision,
@@ -297,6 +423,8 @@ class StreamingVoicebotEngine:
             temperature,
             top_p,
             output_chunk_sec,
+            decode_mode,
+            overlap_frames,
             default_speaker,
             enable_text,
             max_sessions,
@@ -317,6 +445,10 @@ class StreamingVoicebotEngine:
         self.temperature = temperature
         self.top_p = top_p
         self.default_output_chunk_sec = output_chunk_sec
+        self.decode_mode = (
+            decode_mode if decode_mode in {"full_turn", "overlap_stream"} else "full_turn"
+        )
+        self.overlap_frames = max(0, int(overlap_frames))
         self.default_speaker = (
             default_speaker
             if default_speaker in PROMPT_SPEAKERS
@@ -332,6 +464,7 @@ class StreamingVoicebotEngine:
 
         self._sessions: dict[str, _SessionState] = {}
         self._sessions_lock = threading.Lock()
+        self._generate_lock = threading.Lock()
         self._prompt_cache: dict[str, tuple[list[str], list[str]]] = {}
 
         self._vad_model = load_silero_vad()
@@ -426,7 +559,9 @@ class StreamingVoicebotEngine:
         )
 
     def update_session(self, session_id: str, config: SessionConfig) -> None:
-        logger.debug("update_session session_id=%s requested_config=%s", session_id, config)
+        logger.debug(
+            "update_session session_id=%s requested_config=%s", session_id, config
+        )
         state = self._get_session(session_id)
         normalized = self._normalize_config(config)
         with state.lock:
@@ -479,19 +614,44 @@ class StreamingVoicebotEngine:
             raise TypeError("pcm16_16k must be bytes")
         with state.lock:
             prev_size = len(state.audio_buffer)
+            trimmed = False
             state.audio_buffer.extend(pcm16_16k)
             overflow = len(state.audio_buffer) - self.max_input_bytes
             if overflow > 0:
                 del state.audio_buffer[:overflow]
                 # Buffer origin changed due to trim; reset streaming VAD cursor state.
                 self._reset_vad_tracking_locked(state)
+                trimmed = True
                 logger.warning(
                     "append_audio overflow trimmed session_id=%s overflow_bytes=%s buffer_after=%s",
                     session_id,
                     overflow,
                     len(state.audio_buffer),
                 )
-            elif logger.isEnabledFor(logging.DEBUG):
+
+            # In server_vad mode, keep a rolling pre-speech buffer until we actually
+            # detect speech. This prevents long silence from filling the turn buffer.
+            if (
+                state.config.turn_detection.mode == "server_vad"
+                and not state.vad_turn_started
+            ):
+                pre_speech_cap_bytes = min(
+                    self.max_input_bytes,
+                    int(INPUT_SAMPLE_RATE * BYTES_PER_SAMPLE * 5.0),  # 5 seconds
+                )
+                pre_overflow = len(state.audio_buffer) - pre_speech_cap_bytes
+                if pre_overflow > 0:
+                    del state.audio_buffer[:pre_overflow]
+                    self._reset_vad_tracking_locked(state)
+                    trimmed = True
+                    logger.debug(
+                        "append_audio pre-speech trimmed session_id=%s trimmed_bytes=%s buffer_after=%s",
+                        session_id,
+                        pre_overflow,
+                        len(state.audio_buffer),
+                    )
+
+            if not trimmed and logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
                     "append_audio session_id=%s bytes_in=%s buffer_before=%s buffer_after=%s",
                     session_id,
@@ -550,15 +710,12 @@ class StreamingVoicebotEngine:
 
             buffered_samples = len(state.audio_buffer) // 2
             buffered_sec = buffered_samples / float(INPUT_SAMPLE_RATE)
-            if len(state.audio_buffer) >= self.max_input_bytes:
-                return True, "max_buffer", 0.0, buffered_sec
 
             if state.vad_iterator_consumed_bytes > len(state.audio_buffer):
                 self._reset_vad_tracking_locked(state)
             iterator = self._ensure_vad_iterator_locked(state, turn_detection)
-            while (
-                state.vad_iterator_consumed_bytes + VAD_ITERATOR_WINDOW_BYTES
-                <= len(state.audio_buffer)
+            while state.vad_iterator_consumed_bytes + VAD_ITERATOR_WINDOW_BYTES <= len(
+                state.audio_buffer
             ):
                 start = state.vad_iterator_consumed_bytes
                 end = start + VAD_ITERATOR_WINDOW_BYTES
@@ -569,6 +726,7 @@ class StreamingVoicebotEngine:
                 if event is not None:
                     if "start" in event:
                         state.vad_active_speech_start_sample = int(event["start"])
+                        state.vad_turn_started = True
                     elif "end" in event:
                         speech_end = int(event["end"])
                         speech_start = state.vad_active_speech_start_sample
@@ -581,6 +739,7 @@ class StreamingVoicebotEngine:
                         state.vad_total_speech_samples += speech_end - speech_start
                         state.vad_last_speech_end_sample = speech_end
                         state.vad_active_speech_start_sample = None
+                        state.vad_turn_started = True
                 state.vad_iterator_consumed_bytes = end
 
             cursor_samples = buffered_samples
@@ -589,6 +748,8 @@ class StreamingVoicebotEngine:
                 speech_samples += max(
                     0, cursor_samples - state.vad_active_speech_start_sample
                 )
+            if speech_samples > 0:
+                state.vad_turn_started = True
             if speech_samples <= 0:
                 return False, "no_speech", 0.0, buffered_sec
 
@@ -597,6 +758,11 @@ class StreamingVoicebotEngine:
             )
             if speech_samples < max(0, min_speech_samples):
                 return False, "speech_too_short", 0.0, buffered_sec
+
+            # Only allow max-buffer auto-commit after speech has been observed; otherwise
+            # long silence should keep waiting for speech instead of triggering inference.
+            if len(state.audio_buffer) >= self.max_input_bytes:
+                return True, "max_buffer", 0.0, buffered_sec
 
             if state.vad_active_speech_start_sample is not None:
                 return False, "speech_active", 0.0, buffered_sec
@@ -666,6 +832,7 @@ class StreamingVoicebotEngine:
             audio_bytes = bytes(state.audio_buffer)
             state.audio_buffer.clear()
             self._reset_vad_tracking_locked(state)
+            state.vad_turn_started = False
             user_text = state.pending_user_text
             state.pending_user_text = None
             state.turn_index += 1
@@ -683,9 +850,6 @@ class StreamingVoicebotEngine:
                 user_text is not None,
                 config,
             )
-
-        if user_text:
-            self._append_memory(state, "user", user_text)
 
         if not audio_bytes:
             logger.warning(
@@ -767,6 +931,11 @@ class StreamingVoicebotEngine:
             )
             self._clear_active_turn(state, turn_id)
             return
+
+        # Record transcript memory only after current-turn inputs are already built.
+        # This guarantees include_transcript_in_query=false stays audio-only for this turn.
+        if user_text:
+            self._append_memory(state, "user", user_text)
 
         loop = asyncio.get_running_loop()
         event_queue: asyncio.Queue[EngineEvent | None] = asyncio.Queue()
@@ -870,7 +1039,6 @@ class StreamingVoicebotEngine:
                         metrics=metrics,
                     )
                 )
-            loop.call_soon_threadsafe(event_queue.put_nowait, None)
 
         def on_audio_chunk(audio_chunk: np.ndarray) -> None:
             nonlocal first_chunk_ts, last_chunk_ts, total_output_samples
@@ -923,14 +1091,18 @@ class StreamingVoicebotEngine:
                 frames_per_chunk=frames_per_chunk,
                 cancel_event=cancel_event,
                 on_audio_chunk=on_audio_chunk,
+                decode_mode=self.decode_mode,
+                overlap_frames=self.overlap_frames,
                 log_prefix=f"[{session_id}:{turn_id}] ",
             )
             try:
                 logger.debug(
                     "model.generate begin session_id=%s turn_id=%s", session_id, turn_id
                 )
+                with self._generate_lock:
+                    self.model._text_streamer = streamer
                 self.model.generate(
-                    **inputs,
+                    **inputs,  # type: ignore
                     max_new_tokens=self.max_new_tokens,
                     do_sample=True,
                     temperature=self.temperature,
@@ -954,7 +1126,17 @@ class StreamingVoicebotEngine:
                     finalize(cancelled=True)
                     return
 
-                text_output = self._generate_text(inputs, config.text_mode)
+                text_output = self._decode_streamed_text(
+                    streamer, config.text_mode
+                )
+                if not text_output:
+                    logger.info(
+                        "streamed text empty; using _generate_text fallback "
+                        "session_id=%s turn_id=%s",
+                        session_id,
+                        turn_id,
+                    )
+                    text_output = self._generate_text(inputs, config.text_mode)
                 if text_output:
                     self._append_memory(state, "assistant", text_output)
                 finalize(cancelled=False, text_output=text_output)
@@ -974,8 +1156,12 @@ class StreamingVoicebotEngine:
                         message=str(exc),
                     )
                 )
-                loop.call_soon_threadsafe(event_queue.put_nowait, None)
             finally:
+                # Always emit sentinel so commit_turn's event_queue.get()
+                # never blocks indefinitely.
+                loop.call_soon_threadsafe(event_queue.put_nowait, None)
+                with self._generate_lock:
+                    self.model._text_streamer = None
                 self._clear_active_turn(state, turn_id)
                 logger.debug(
                     "generation thread cleanup done session_id=%s turn_id=%s",
@@ -1169,10 +1355,10 @@ class StreamingVoicebotEngine:
             ]
         ]
         logger.info(
-            "thinker.input_prompt session_id=%s turn_id=%s prompt=%s",
+            "thinker.input_prompt session_id=%s turn_id=%s prompt=\n%s",
             session_id,
             turn_id,
-            _clip_text(system_text, max_chars=520),
+            system_text,
         )
         inputs = self.processor(
             conversation,
@@ -1221,6 +1407,38 @@ class StreamingVoicebotEngine:
             history_preview,
         )
 
+    def _decode_streamed_text(
+        self, streamer: _EngineAudioStreamer, text_mode: str
+    ) -> str | None:
+        """Decode text token IDs collected by the streamer during generation."""
+        if not self.enable_text or text_mode == "none":
+            logger.debug("decode_streamed_text skipped by config")
+            return None
+        token_ids = streamer.get_text_token_ids()
+        logger.info(
+            "decode_streamed_text token_count=%s text_mode=%s",
+            len(token_ids),
+            text_mode,
+        )
+        if not token_ids:
+            logger.debug("decode_streamed_text no tokens collected")
+            return None
+        text = self.processor.tokenizer.decode(
+            token_ids, skip_special_tokens=True
+        ).strip()
+        if not text:
+            logger.debug("decode_streamed_text decoded empty text")
+            return None
+        logger.info("thinker.output (streamed) text=%s", _clip_text(text))
+        if text_mode == "final":
+            return text
+        # sentence mode: keep first complete sentence if possible
+        for delimiter in [". ", "! ", "? ", "。", "！", "？"]:
+            if delimiter in text:
+                sentence = text.split(delimiter, 1)[0].strip() + delimiter.strip()
+                return sentence
+        return text
+
     @torch.no_grad()
     def _generate_text(
         self, inputs: dict[str, torch.Tensor], text_mode: str
@@ -1236,7 +1454,7 @@ class StreamingVoicebotEngine:
             logger.debug("generate_text skipped no thinker_input_ids")
             return None
 
-        output_ids = self.model.thinker.generate(
+        output_ids = self.model.thinker.generate(  # type: ignore
             input_ids=thinker_input_ids,
             attention_mask=inputs.get("thinker_attention_mask"),
             input_features=inputs.get("thinker_input_features"),
@@ -1245,7 +1463,8 @@ class StreamingVoicebotEngine:
             do_sample=True,
             temperature=self.temperature,
             top_p=self.top_p,
-            use_cache=True,
+            use_cache=False,
+            # use_cache=True,
         )
         prompt_len = thinker_input_ids.shape[1]
         generated_ids = output_ids[0, prompt_len:]

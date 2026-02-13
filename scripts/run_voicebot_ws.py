@@ -29,6 +29,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--output-chunk-sec", type=float, default=0.24)
+    parser.add_argument(
+        "--decode-mode",
+        type=str,
+        default="full_turn",
+        choices=["full_turn", "overlap_stream"],
+        help="Audio decode strategy for generated codec frames",
+    )
+    parser.add_argument(
+        "--overlap-frames",
+        type=int,
+        default=2,
+        help="Overlap frame window used only when decode-mode=overlap_stream",
+    )
     parser.add_argument("--use-half-precision", action="store_true")
     parser.add_argument("--disable-text", action="store_true")
     parser.add_argument("--max-sessions", type=int, default=3)
@@ -87,6 +100,8 @@ def main() -> None:
         temperature=args.temperature,
         top_p=args.top_p,
         output_chunk_sec=args.output_chunk_sec,
+        decode_mode=args.decode_mode,
+        overlap_frames=args.overlap_frames,
         default_speaker=args.prompt_speaker,
         enable_text=not args.disable_text,
         max_sessions=args.max_sessions,

@@ -614,6 +614,13 @@ class ChromaForConditionalGeneration(ChromaPreTrainedModel, ChromaGenerationMixi
             thinker_attention_values = (~thinker_eos).long().unsqueeze(1)
             attention_mask = torch.cat([attention_mask, thinker_attention_values, thinker_attention_values], dim=1)
 
+            # Forward the newly produced thinker token to the text streamer
+            # *before* updating thinker_eos / thinker_input_ids, so that
+            # the token preceding EOS is not silently dropped.
+            _ts = getattr(self, "_text_streamer", None)
+            if _ts is not None and not next_token_eos.all():
+                _ts.put_text_token(thinker_next_ids[:, -1].cpu())
+
             # Update thinker_eos for next iteration
             thinker_eos = new_thinker_eos
             thinker_input_ids = thinker_next_ids if not thinker_eos.all() else None

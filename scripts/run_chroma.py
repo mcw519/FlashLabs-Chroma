@@ -138,7 +138,7 @@ def chroma_inference(
     start_time = time.perf_counter()
     output = model.generate(
         **inputs,
-        max_new_tokens=1000,
+        max_new_tokens=256,
         do_sample=True,
         temperature=0.7,
         top_p=0.9,

@@ -72,6 +72,8 @@ class ChromaRealtimeEngine:
         temperature: float,
         top_p: float,
         output_chunk_sec: float,
+        decode_mode: str,
+        overlap_frames: int,
         default_speaker: str,
         enable_text: bool,
         bot_config_path: str | None,
@@ -87,6 +89,8 @@ class ChromaRealtimeEngine:
             temperature=temperature,
             top_p=top_p,
             output_chunk_sec=output_chunk_sec,
+            decode_mode=decode_mode,
+            overlap_frames=overlap_frames,
             default_speaker=default_speaker,
             enable_text=enable_text,
             max_sessions=3,
@@ -220,11 +224,24 @@ def parse_args() -> argparse.Namespace:
         help="Path to bot config (.json/.toml) with system_prompt",
     )
     parser.add_argument("--prompt-speaker", type=str, default="scarlett_johansson")
-    parser.add_argument("--max-new-tokens", type=int, default=1000)
-    parser.add_argument("--max-text-new-tokens", type=int, default=64)
+    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--max-text-new-tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--output-chunk-sec", type=float, default=0.24)
+    parser.add_argument(
+        "--decode-mode",
+        type=str,
+        default="full_turn",
+        choices=["full_turn", "overlap_stream"],
+        help="Audio decode strategy for generated codec frames",
+    )
+    parser.add_argument(
+        "--overlap-frames",
+        type=int,
+        default=2,
+        help="Overlap frame window used only when decode-mode=overlap_stream",
+    )
     parser.add_argument("--use-half-precision", action="store_true")
     parser.add_argument("--disable-text", action="store_true")
     parser.add_argument("--host", type=str, default="0.0.0.0")
@@ -248,6 +265,8 @@ def main() -> None:
         temperature=args.temperature,
         top_p=args.top_p,
         output_chunk_sec=args.output_chunk_sec,
+        decode_mode=args.decode_mode,
+        overlap_frames=args.overlap_frames,
         default_speaker=args.prompt_speaker,
         enable_text=not args.disable_text,
         bot_config_path=args.bot_config,

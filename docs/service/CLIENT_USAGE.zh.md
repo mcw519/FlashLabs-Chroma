@@ -1,34 +1,54 @@
 # Chroma WS Client 使用指南（V2）
 
-## 1. 啟動 Server
+## 1. 前置需求
+- 已安裝專案依賴（建議 `uv sync`）
+- server 可讀到 Chroma 模型（預設 `FlashLabs/Chroma-4B`）
+- 麥克風 client 需要 `sounddevice` 可用音訊裝置
+
+## 2. 最快開始（Mic Client）
+
+### 2.1 開一個 Terminal 啟動 Server
 ```bash
 python scripts/run_voicebot_ws.py \
   --use-half-precision \
+  --decode-mode full_turn \
   --prompt-speaker scarlett_johansson \
   --host 0.0.0.0 \
   --port 8765
 ```
 
-## 2. 啟動麥克風 Client
+### 2.2 另一個 Terminal 啟動麥克風 Client
 ```bash
 python scripts/run_voicebot_ws_mic_client.py \
   --url ws://127.0.0.1:8765 \
   --speaker scarlett_johansson
 ```
 
-## 3. Turn Detection 模式
-### Client 主導切 turn
+### 2.3 結束連線
+- 在 client 輸入 `/quit` + Enter，會送 `session.close` 並斷線。
+
+## 3. 常用啟動組合
+
+### 3.1 低延遲語音串流（overlap_stream）
+Server：
 ```bash
-python scripts/run_voicebot_ws_mic_client.py \
-  --turn-detection-mode client_commit \
-  --client-vad-threshold 0.015 \
-  --client-min-speech-ms 280 \
-  --client-pause-ms 500
+python scripts/run_voicebot_ws.py \
+  --decode-mode overlap_stream \
+  --overlap-frames 2 \
+  --output-chunk-sec 0.20
 ```
 
-### Server 主導切 turn
+Client：
 ```bash
 python scripts/run_voicebot_ws_mic_client.py \
+  --url ws://127.0.0.1:8765 \
+  --output-chunk-sec 0.20
+```
+
+### 3.2 server 主導切 turn（server_vad）
+```bash
+python scripts/run_voicebot_ws_mic_client.py \
+  --url ws://127.0.0.1:8765 \
   --turn-detection-mode server_vad \
   --turn-threshold 0.5 \
   --turn-min-speech-ms 250 \
@@ -36,82 +56,138 @@ python scripts/run_voicebot_ws_mic_client.py \
   --turn-speech-pad-ms 200
 ```
 
-## 4. 主要參數分類
-- Session：`--session-id`、`--speaker`、`--memory-turns`、`--output-chunk-sec`
-- Prompt/輸出：`--text-mode`、`--include-transcript-in-query`、`--system-prompt`
-- Server 推論：`--trim-with-vad`、`--turn-*`
-- Client VAD/輸入：`--client-*`
-- 音訊裝置：`--input-device`、`--output-device`、`--disable-playback`
+### 3.3 client 主導切 turn（client_commit）
+```bash
+python scripts/run_voicebot_ws_mic_client.py \
+  --url ws://127.0.0.1:8765 \
+  --turn-detection-mode client_commit \
+  --client-vad-threshold 0.015 \
+  --client-min-speech-ms 280 \
+  --client-pause-ms 500
+```
 
-## 5. 詳細參數對照
+### 3.4 關閉文字輸出 / 關閉 session log
+```bash
+python scripts/run_voicebot_ws.py \
+  --disable-text \
+  --disable-session-log
+```
 
-### 5.1 Server 啟動參數（`scripts/run_voicebot_ws.py`）
+### 3.5 啟用 server ASR（commit 時自動轉錄）
+```bash
+python scripts/run_voicebot_ws.py \
+  --server-asr-model openai/whisper-small \
+  --server-asr-language en \
+  --server-asr-timeout-sec 1.2
+```
 
-| 參數 | 型別 | 預設值 | 說明 |
-| --- | --- | --- | --- |
-| `--model-path` | `string` | `None` | 本地模型路徑；不帶時走預設 HF model id。 |
-| `--bot-config` | `string` | `None` | JSON/TOML 設定檔，可提供啟動時 `system_prompt`。 |
-| `--prompt-speaker` | `string` | `scarlett_johansson` | session 未指定 speaker 時的預設值。 |
-| `--max-new-tokens` | `int` | `1000` | 每回合音訊生成 token 上限。 |
-| `--max-text-new-tokens` | `int` | `64` | thinker 文字分支 token 上限。 |
-| `--temperature` | `float` | `0.7` | 採樣溫度。 |
-| `--top-p` | `float` | `0.9` | nucleus sampling 門檻。 |
-| `--output-chunk-sec` | `float` | `0.24` | session 未指定時的預設 chunk 秒數。 |
-| `--use-half-precision` | `flag` | `false` | CUDA 可用時請求 fp16。 |
-| `--disable-text` | `flag` | `false` | 關閉 thinker 文字輸出事件。 |
-| `--max-sessions` | `int` | `3` | engine 允許同時存在的 session 數。 |
-| `--host` | `string` | `0.0.0.0` | WebSocket 綁定 host。 |
-| `--port` | `int` | `8765` | WebSocket 綁定 port。 |
-| `--max-message-size` | `int` | `8388608` | WS 單訊息大小上限（bytes）。 |
-| `--warmup` | `flag` | `false` | 啟動時先跑一輪 warmup。 |
-| `--server-asr-model` | `string` | `""` | 啟用 server-side ASR。 |
-| `--server-asr-language` | `string` | `""` | ASR 語言提示（可選）。 |
-| `--server-asr-device` | `auto\|cpu\|cuda` | `auto` | ASR 執行裝置。 |
-| `--server-asr-timeout-sec` | `float` | `1.2` | 每次 commit 的 ASR timeout。 |
-| `--session-log-root` | `string` | `None` | session log 根目錄（預設為 `<repo>/logs`）。 |
-| `--disable-session-log` | `flag` | `false` | 完全關閉 session log 檔案落地（音訊 + `conversation_log.json`）。 |
+## 4. 參數地圖（誰影響什麼）
 
-### 5.2 Mic Client 會送到 Session Config 的參數（`scripts/run_voicebot_ws_mic_client.py`）
+### 4.1 Server（`scripts/run_voicebot_ws.py`）
+核心：
+- 推論：`--max-new-tokens`、`--temperature`、`--top-p`
+- 串流：`--decode-mode`、`--overlap-frames`、`--output-chunk-sec`
+- 服務：`--host`、`--port`、`--max-message-size`、`--max-sessions`
+- 功能：`--disable-text`、`--warmup`、`--server-asr-*`、`--disable-session-log`
 
-| 參數 | Config 欄位 | 型別 | 預設值 | 說明 |
-| --- | --- | --- | --- | --- |
-| `--speaker` | `speaker` | `string` | `scarlett_johansson` | persona speaker。 |
-| `--memory-turns` | `memory_turns` | `int` | `6` | `<0` 會被 server 正規化成 `0`。 |
-| `--output-chunk-sec` | `output_chunk_sec` | `float` | `0.24` | `<=0` 會被回退到預設值。 |
-| `--text-mode` | `text_mode` | `enum` | `sentence` | `none`、`sentence`、`final`。 |
-| `--include-transcript-in-query` | `include_transcript_in_query` | `bool` | `false` | 是否把 transcript 直接放進同回合 query。 |
-| `--system-prompt` | `system_prompt` | `string\|null` | `None` | 若有值會 trim，且不可空字串。 |
-| `--trim-with-vad` | `trim_with_vad` | `bool` | `false` | 推論前是否做 VAD trim。 |
-| `--turn-detection-mode` | `turn_detection.mode` | `enum` | `client_commit` | 決定 turn 邊界主導方。 |
-| `--turn-threshold` | `turn_detection.threshold` | `float` | `0.5` | `server_vad` 模式使用。 |
-| `--turn-min-speech-ms` | `turn_detection.min_speech_ms` | `int` | `250` | `server_vad` 模式使用。 |
-| `--turn-min-silence-ms` | `turn_detection.min_silence_ms` | `int` | `500` | `server_vad` 模式使用。 |
-| `--turn-speech-pad-ms` | `turn_detection.speech_pad_ms` | `int` | `200` | `server_vad` 模式使用。 |
+### 4.2 Mic Client 送進 session config 的參數
+- `--speaker` -> `speaker`
+- `--memory-turns` -> `memory_turns`
+- `--output-chunk-sec` -> `output_chunk_sec`
+- `--text-mode` -> `text_mode`
+- `--include-transcript-in-query` -> `include_transcript_in_query`
+- `--system-prompt` -> `system_prompt`
+- `--trim-with-vad` -> `trim_with_vad`
+- `--turn-detection-mode` / `--turn-*` -> `turn_detection.*`
 
-### 5.3 Mic Client 本地行為參數（不會寫進 session config）
+Transcript 時序：
+- `include_transcript_in_query=false`：當回合 query 不帶 transcript；transcript 只會加入短期 memory 供後續回合使用。
+- `include_transcript_in_query=true`：當回合 query 會帶 transcript（`text + audio`）。
 
-| 參數 | 型別 | 預設值 | 說明 |
-| --- | --- | --- | --- |
-| `--client-chunk-ms` | `int` | `40` | 麥克風擷取 chunk 長度。 |
-| `--client-pre-roll-ms` | `int` | `200` | client VAD 觸發前保留的 pre-roll。 |
-| `--client-min-speech-ms` | `int` | `280` | `client_commit` 模式判定可 commit 的最短語音。 |
-| `--client-pause-ms` | `int` | `500` | `client_commit` 模式下靜音 commit 門檻。 |
-| `--client-vad-threshold` | `float` | `0.015` | `client_commit` 模式 RMS 門檻。 |
-| `--input-device` | `string` | `None` | 輸入裝置名稱或 index。 |
-| `--output-device` | `string` | `None` | 輸出裝置名稱或 index。 |
-| `--disable-playback` | `flag` | `false` | 關閉本地播放。 |
-| `--jitter-buffer-ms` | `int` | `300` | 播放 jitter buffer 大小。 |
-| `--crossfade-ms` | `float` | `8.0` | chunk 接縫平滑（`0` 到 `10`）。 |
-| `--no-device-prompt` | `flag` | `false` | 跳過互動式裝置選單。 |
-| `--no-color` | `flag` | `false` | 關閉本地顏色標籤。 |
-| `--log-level` | `string` | `INFO` | 本地 logger level。 |
+### 4.3 Mic Client 本地行為（不送 server）
+- VAD/送流：`--client-*`
+- 音訊裝置：`--input-device`、`--output-device`
+- 播放平滑：`--jitter-buffer-ms`、`--crossfade-ms`
+- 互動與顯示：`--no-device-prompt`、`--no-color`、`--log-level`
 
-## 6. 執行時指令
-- 輸入 `/quit` 後 Enter，client 會送 `session.close` 並斷線。
+## 5. 純 WebSocket 使用範例（Python）
 
-## 7. Server Session Logs
-- Server 會把 log 存在 `logs/YYYY-MM-DD/<session_id>/`。
-- user 每回合音訊會分段存成 `user_0001.wav`、`user_0002.wav`...（16kHz PCM16 單聲道）。
-- model 生成音訊會分段存成 `bot_0001.wav`、`bot_0002.wav`...（24kHz PCM16 單聲道，該回合有輸出才會有檔案）。
-- 同一資料夾內會有 `conversation_log.json`，記錄每回合對話與 metrics。
-- 若要關閉上述落地，啟動 server 時加上 `--disable-session-log`。
+```python
+import asyncio
+import base64
+import json
+import wave
+import websockets
+
+
+def load_pcm16_16k_mono_b64(path: str) -> str:
+    with wave.open(path, "rb") as wf:
+        assert wf.getnchannels() == 1
+        assert wf.getsampwidth() == 2
+        assert wf.getframerate() == 16000
+        pcm = wf.readframes(wf.getnframes())
+    return base64.b64encode(pcm).decode("ascii")
+
+
+async def main():
+    session_id = "demo-s1"
+    audio_b64 = load_pcm16_16k_mono_b64("example/make_taco.wav")
+
+    async with websockets.connect("ws://127.0.0.1:8765") as ws:
+        await ws.send(json.dumps({
+            "type": "session.open",
+            "session_id": session_id,
+            "config": {
+                "speaker": "scarlett_johansson",
+                "text_mode": "final",
+                "turn_detection": {"mode": "client_commit"}
+            }
+        }))
+        print(await ws.recv())  # session.opened
+
+        await ws.send(json.dumps({
+            "type": "input.audio.append",
+            "session_id": session_id,
+            "audio_b64": audio_b64
+        }))
+        print(await ws.recv())  # input.audio.accepted
+
+        await ws.send(json.dumps({
+            "type": "input.turn.commit",
+            "session_id": session_id,
+            "transcript": "please summarize this audio"
+        }))
+
+        while True:
+            msg = json.loads(await ws.recv())
+            print(msg["type"])
+            if msg["type"] in {"response.done", "response.cancelled", "error"}:
+                break
+
+        await ws.send(json.dumps({"type": "session.close", "session_id": session_id}))
+        print(await ws.recv())  # session.closed
+
+
+asyncio.run(main())
+```
+
+## 6. Barge-in（打斷模型說話）
+- client 可在偵測到使用者開口後送：
+```json
+{"type":"response.cancel","session_id":"..."}
+```
+- 成功中斷時，事件流會回 `response.cancelled`。
+
+## 7. Troubleshooting
+- `invalid_base64`
+  - `audio_b64` 非合法 base64，或編碼來源不是 PCM bytes。
+- `audio_too_short`
+  - commit 後有效語音太短（可能被 VAD trim 掉）。可提高錄音長度或調整 VAD 參數。
+- 收到音訊但沒聲音
+  - 確認 client 播放未 `--disable-playback`，且 `--output-device` 正確。
+- `Max sessions limit reached`
+  - 調大 server `--max-sessions` 或關閉舊 session。
+
+## 8. 參考文件
+- 服務協議：`docs/service/STREAMING_SERVICE_SPEC.zh.md`
+- 模型串流演算：`docs/model/S2S_PIPELINE.zh.md`

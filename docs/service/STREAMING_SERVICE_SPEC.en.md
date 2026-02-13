@@ -1,20 +1,63 @@
-# Chroma Streaming Service Spec (V2)
+# Chroma Streaming Service Spec (WebSocket V2)
 
 ## 1. Scope
-This document defines the WebSocket protocol for Chroma streaming inference.
-V2 is **breaking** and replaces previous event names.
+This document is an implementation-aligned spec for `scripts/run_voicebot_ws.py`.
+It covers:
+- server startup and runtime capabilities
+- session config schema and normalization rules
+- client/server event contracts and timing
+- server-side VAD auto-commit and cancel behavior
+- persisted session log artifacts
 
-## 2. Audio Contract
-- Client -> Server (`input.audio.append.audio_b64`): PCM16LE, 16kHz, mono
-- Server -> Client (`response.audio.delta.audio_b64`): PCM16LE, 24kHz, mono
+## 2. Quick Server Startup
 
-## 3. Session Config Schema
+### 2.1 Minimal startup
+```bash
+python scripts/run_voicebot_ws.py \
+  --host 0.0.0.0 \
+  --port 8765 \
+  --decode-mode full_turn \
+  --prompt-speaker scarlett_johansson
+```
+
+### 2.2 Low-latency incremental decode
+```bash
+python scripts/run_voicebot_ws.py \
+  --decode-mode overlap_stream \
+  --overlap-frames 2 \
+  --output-chunk-sec 0.24
+```
+
+### 2.3 Enable server-side ASR
+```bash
+python scripts/run_voicebot_ws.py \
+  --server-asr-model openai/whisper-small \
+  --server-asr-language en \
+  --server-asr-device auto \
+  --server-asr-timeout-sec 1.2
+```
+
+### 2.4 Disable text branch and persisted session logs
+```bash
+python scripts/run_voicebot_ws.py \
+  --disable-text \
+  --disable-session-log
+```
+
+## 3. Audio Contract
+- Client -> Server (`input.audio.append.audio_b64`)
+  - PCM16LE, 16kHz, mono
+- Server -> Client (`response.audio.delta.audio_b64`)
+  - PCM16LE, 24kHz, mono
+  - `mime_type=audio/pcm;rate=24000;encoding=s16le`
+
+## 4. Session Config Schema
 ```json
 {
   "speaker": "scarlett_johansson",
   "memory_turns": 6,
   "output_chunk_sec": 0.24,
-  "text_mode": "sentence",
+  "text_mode": "final",
   "include_transcript_in_query": false,
   "system_prompt": null,
   "trim_with_vad": false,
@@ -28,28 +71,38 @@ V2 is **breaking** and replaces previous event names.
 }
 ```
 
-## 4. Session Config Parameters
+Notes:
+- `SessionConfigV2` dataclass default `text_mode` is `final`.
+- The mic client script defaults to `text_mode=sentence` and sends that explicitly.
 
-| Field | Type | Default | Allowed / Normalization | Behavior |
-| --- | --- | --- | --- | --- |
-| `speaker` | `string` | `scarlett_johansson` | If unknown, server falls back to startup default speaker. | Selects prompt audio/text persona for style. |
-| `memory_turns` | `int` | `6` | `<0` is normalized to `0`. | Number of recent user/assistant turns kept in prompt memory context. |
-| `output_chunk_sec` | `float` | `0.24` | `<=0` is normalized to `0.24`. | Target audio chunk duration emitted in `response.audio.delta`. |
-| `text_mode` | `none \| sentence \| final` | `sentence` | Invalid values become `sentence`. | Controls text emission policy (`response.text.delta`). |
-| `include_transcript_in_query` | `bool` | `false` | String/number booleans are coerced by server (`true/1/yes/on`, `false/0/no/off`). | If `true`, transcript text is injected into same-turn model query with audio. |
-| `system_prompt` | `string \| null` | `null` | If string: trimmed, must be non-empty, max `4000` chars. | Per-session system prompt override. `null` clears override. |
-| `trim_with_vad` | `bool` | `false` | Boolean coercion applies. | If `true`, pre-inference audio is trimmed with VAD boundaries. |
-| `turn_detection.mode` | `client_commit \| server_vad` | `server_vad` | Invalid values normalize to `server_vad`. | Decides who owns turn boundary commit. |
-| `turn_detection.threshold` | `float` | `0.5` | Must be `(0, 1]`; else normalized to `0.5`. | Silero VAD sensitivity for server-owned turn detection. |
-| `turn_detection.min_speech_ms` | `int` | `250` | `<0` normalized to `0`. | Minimum speech duration for a valid speech region. |
-| `turn_detection.min_silence_ms` | `int` | `500` | `<0` normalized to `0`. | Required trailing silence before server auto-commit. |
-| `turn_detection.speech_pad_ms` | `int` | `200` | `<0` normalized to `0`. | Speech boundary padding around detected speech segments. |
+## 5. Server Normalization Rules
 
-## 5. Turn Ownership
-- `turn_detection.mode=client_commit`: client sends `input.turn.commit`; server does not auto-commit.
-- `turn_detection.mode=server_vad`: server auto-commits with Silero `VADIterator` in incremental streaming mode.
+| Field | Rule |
+| --- | --- |
+| `speaker` | Unknown speaker falls back to server startup default (`--prompt-speaker`). |
+| `memory_turns` | Values `<0` normalize to `0`. |
+| `output_chunk_sec` | Values `<=0` normalize to server default (`--output-chunk-sec`). |
+| `text_mode` | Only `none/sentence/final` accepted, otherwise normalized to `sentence`. |
+| `include_transcript_in_query` | Boolean coercion: `1/true/yes/on -> true`; `0/false/no/off/"" -> false`. `false`: transcript is excluded from same-turn query and appended to memory after input preparation (affects later turns). `true`: transcript is included in same-turn user query (`text + audio`). |
+| `system_prompt` | `null` clears override; string is trimmed, must be non-empty, max 4000 chars. |
+| `trim_with_vad` | Same boolean coercion behavior. |
+| `turn_detection.mode` | Only `client_commit/server_vad`, otherwise normalized to `server_vad`. |
+| `turn_detection.threshold` | Must be `(0,1]`, otherwise normalized to `0.5`. |
+| `turn_detection.min_speech_ms` | Values `<0` normalize to `0`. |
+| `turn_detection.min_silence_ms` | Values `<0` normalize to `0`. |
+| `turn_detection.speech_pad_ms` | Values `<0` normalize to `0`. |
 
-## 6. Client -> Server Events
+## 6. Turn Ownership Modes
+- `turn_detection.mode=client_commit`
+  - Client must send `input.turn.commit`.
+  - Server does not auto-commit.
+- `turn_detection.mode=server_vad`
+  - Server continuously evaluates incoming audio with Silero `VADIterator`.
+  - Server auto-commits when speech/silence criteria are satisfied.
+
+## 7. Event Protocol
+
+### 7.1 Client -> Server
 1. `session.open`
 2. `session.update`
 3. `input.audio.append`
@@ -57,55 +110,78 @@ V2 is **breaking** and replaces previous event names.
 5. `response.cancel`
 6. `session.close`
 
-### 6.1 Event Payload Notes
-- `session.open`: `session_id` optional; server generates one if omitted. `config` optional.
-- `session.update`: requires `session_id`; `config` is partial patch and merged with existing session config.
-- `input.audio.append`: requires `session_id` + non-empty `audio_b64` (base64 PCM16/16k/mono bytes).
-- `input.turn.commit`: requires `session_id`; optional `transcript` (`string`).
-- `response.cancel`: requires `session_id`; asynchronous request, no explicit acknowledgement event.
-- `session.close`: requires `session_id`; server responds with `session.closed`.
-
-## 7. Server -> Client Events
+### 7.2 Server -> Client
 1. `session.opened`
 2. `session.updated`
 3. `input.audio.accepted`
 4. `response.stream.opened`
 5. `response.started`
 6. `response.audio.delta`
-7. `response.text.delta`
+7. `response.text.delta` (optional)
 8. `response.done`
 9. `response.cancelled`
 10. `session.closed`
 11. `error`
 
-### 7.1 Event Payload Notes
-- `session.opened` / `session.updated`: include normalized `config`.
-- `input.audio.accepted`: includes `num_bytes` for accepted chunk size.
-- `response.stream.opened`: emitted before model events for a committed turn.
-- `response.audio.delta`: always mono 24k PCM payload (`audio_b64`).
-- `response.done`: includes `metrics` (`ttfs_ms`, `chunk_gap_ms`, throughput fields, etc.).
-- `error`: shape `{type, session_id, code, message, details?}`.
+## 8. Payload Notes
 
-### 7.2 Server Session Log Artifacts
-- Logs are written under `logs/YYYY-MM-DD/<session_id>/`.
-- If `session_id` contains filesystem-unsafe chars, the directory name is sanitized (`[^A-Za-z0-9._-]` -> `_`).
-- User audio per committed turn is saved as `user_0001.wav`, `user_0002.wav`, ... (16kHz PCM16 mono).
-- Assistant audio per turn is saved as `bot_0001.wav`, `bot_0002.wav`, ... (24kHz PCM16 mono) when audio exists.
-- Turn records are appended to `conversation_log.json` in the same directory.
-- `conversation_log.json` stores per-turn `user`/`assistant` text, audio filenames, `event`, `metrics`, and optional `error`.
-- File persistence can be disabled by starting server with `--disable-session-log`.
+### 8.1 `session.open`
+```json
+{"type":"session.open","session_id":"s1","config":{...}}
+```
+- `session_id` is optional; server generates UUID when omitted.
+- `session.opened` includes normalized config.
 
-## 8. Typical Flow
+### 8.2 `input.audio.append`
+```json
+{"type":"input.audio.append","session_id":"s1","audio_b64":"..."}
+```
+- `audio_b64` is required and must be valid base64.
+- Success returns `input.audio.accepted` with `num_bytes`.
+
+### 8.3 `input.turn.commit`
+```json
+{"type":"input.turn.commit","session_id":"s1","transcript":"hello"}
+```
+- `transcript` is optional.
+- If server ASR is enabled and succeeds, server transcript overrides client transcript.
+
+### 8.4 `response.cancel`
+```json
+{"type":"response.cancel","session_id":"s1"}
+```
+- Asynchronous request; no dedicated ack event is guaranteed.
+- Successful interruption eventually yields `response.cancelled`.
+
+### 8.5 `response.done`
+Core fields:
+- `session_id`, `turn_id`
+- `text` (possibly `null`)
+- `metrics` (`ttfs_ms`, `audio_out_sec`, `tokens_per_sec`, etc.)
+
+## 9. Typical Timelines
+
+### 9.1 `client_commit`
 1. `session.open`
 2. `input.audio.append` x N
-3. (`input.turn.commit` in `client_commit` mode)
+3. `input.turn.commit`
 4. `response.stream.opened`
 5. `response.started`
 6. `response.audio.delta` x N
 7. `response.text.delta` (optional)
 8. `response.done`
 
-## 9. Error Codes
+### 9.2 `server_vad`
+1. `session.open` with `turn_detection.mode=server_vad`
+2. continuous `input.audio.append`
+3. server auto-commit trigger
+4. `response.stream.opened`
+5. `response.started`
+6. `response.audio.delta` x N
+7. `response.done` or `response.cancelled`
+
+## 10. Error Codes
+Common `error.code` values:
 - `bad_json`
 - `missing_type`
 - `unknown_type`
@@ -113,53 +189,72 @@ V2 is **breaking** and replaces previous event names.
 - `invalid_base64`
 - `request_failed`
 - `audio_commit_failed`
+- engine-originated codes may also appear, such as `empty_audio`, `audio_too_short`, `generation_failed`
 
-## 10. V1 -> V2 Migration Guide (Breaking)
+## 11. Persisted Session Logs
+Enabled by default (`--disable-session-log` turns it off).
 
-This upgrade is V2-only and does not provide a V1 adapter.  
-If a client still sends V1 event names, the server returns `unknown_type`.
+Directory: `logs/YYYY-MM-DD/<session_id>/`
+- Session id is sanitized for filesystem safety when needed.
 
-### 10.1 Event Name Mapping
+Artifacts:
+- `user_0001.wav`, `user_0002.wav`, ... (16kHz PCM16 mono)
+- `bot_0001.wav`, `bot_0002.wav`, ... (24kHz PCM16 mono)
+- `conversation_log.json` (turn-level event/text/metrics/error records)
 
-| V1 | V2 | Notes |
+## 12. Server Startup Flags (`scripts/run_voicebot_ws.py`)
+
+| Flag | Default | Description |
 | --- | --- | --- |
-| `session.start` | `session.open` | Create session. |
-| `session.started` | `session.opened` | Session created event. |
-| `audio.append` | `input.audio.append` | Upload audio chunk. |
-| `audio.appended` | `input.audio.accepted` | Server accepted audio chunk. |
-| `audio.commit` | `input.turn.commit` | Commit turn and trigger inference. |
-| `response.stream.started` | `response.stream.opened` | Stream-open marker before model events. |
-| `response.cancel` | `response.cancel` | Name unchanged, response behavior changed. |
-| `session.end` | `session.close` | Close session. |
-| `session.ended` | `session.closed` | Session closed event. |
-| `session.update` | `session.update` | Name unchanged. |
+| `--model-path` | `None` | Local model path; default behavior uses HF model id. |
+| `--bot-config` | `None` | JSON/TOML bot config (can provide system prompt). |
+| `--prompt-speaker` | `scarlett_johansson` | Session speaker fallback. |
+| `--max-new-tokens` | `1000` | Max generation steps per turn. |
+| `--max-text-new-tokens` | `64` | Thinker text branch cap. |
+| `--temperature` | `0.7` | Sampling temperature. |
+| `--top-p` | `0.9` | Nucleus sampling threshold. |
+| `--output-chunk-sec` | `0.24` | Default audio chunk seconds. |
+| `--decode-mode` | `full_turn` | `full_turn` or `overlap_stream`. |
+| `--overlap-frames` | `2` | Used only in `overlap_stream`. |
+| `--use-half-precision` | `false` | Request fp16 when CUDA is available. |
+| `--disable-text` | `false` | Disable text output events. |
+| `--max-sessions` | `3` | Maximum active sessions. |
+| `--host` | `0.0.0.0` | Bind host. |
+| `--port` | `8765` | Bind port. |
+| `--max-message-size` | `8388608` | Max WebSocket message size in bytes. |
+| `--warmup` | `false` | Run one warmup turn at startup. |
+| `--server-asr-model` | `""` | Server-side ASR model id/path. |
+| `--server-asr-language` | `""` | Optional ASR language hint. |
+| `--server-asr-device` | `auto` | `auto/cpu/cuda`. |
+| `--server-asr-timeout-sec` | `1.2` | ASR timeout per turn. |
+| `--session-log-root` | `None` | Session log root (`<repo>/logs` by default). |
+| `--disable-session-log` | `false` | Disable persisted session logs. |
 
-### 10.2 Session Config Mapping
+### 12.1 LLM Generation Step Profiler (Environment Variables)
+To observe smoothness at the per-generation-step level, enable the built-in profiler in `chroma/generation_chroma.py`:
 
-| V1 Field | V2 Field | Mapping Rule |
-| --- | --- | --- |
-| `auto_commit` | `turn_detection.mode` | `true -> server_vad`; `false -> client_commit`. |
-| `vad_threshold` | `turn_detection.threshold` | Direct mapping. |
-| `vad_min_speech_ms` | `turn_detection.min_speech_ms` | Direct mapping. |
-| `vad_min_silence_ms` | `turn_detection.min_silence_ms` | Direct mapping. |
-| `vad_speech_pad_ms` | `turn_detection.speech_pad_ms` | Direct mapping. |
+- `CHROMA_GEN_STEP_PROFILE`
+  - Enable with `1/true/yes/on`; disabled by default.
+- `CHROMA_GEN_STEP_PROFILE_INTERVAL`
+  - Emit one profiling log every N steps, default `10`.
+- `CHROMA_GEN_STEP_PROFILE_CUDA_SYNC`
+  - Whether to call `torch.cuda.synchronize()` before/after timing, enabled by default (`1`).
+  - Keep this enabled on GPU for accurate step latency.
 
-Notes:
-- V2 uses `turn_detection` as the only source of turn-segmentation settings.
-- V1 flat fields are not applied by the V2 schema; keeping them becomes a silent no-op and can cause config drift.
+Example:
+```bash
+CHROMA_GEN_STEP_PROFILE=1 \
+CHROMA_GEN_STEP_PROFILE_INTERVAL=10 \
+CHROMA_GEN_STEP_PROFILE_CUDA_SYNC=1 \
+python scripts/run_voicebot_ws.py --decode-mode overlap_stream --overlap-frames 2 --output-chunk-sec 0.24
+```
 
-### 10.3 Behavioral Changes You Must Handle
+`gen-step ...` log fields:
+- `step_ms`: total latency of one generation step
+- `forward_ms`: backbone forward latency
+- `sample_ms`: token sampling latency
+- `decoder_ms`: depth decoder generation latency
+- `put_ms`: streamer handoff latency
+- `step_p50` / `step_p95`: running median / p95 over observed steps
 
-1. `response.cancel` no longer emits `response.cancelled.requested`.
-2. Successful cancellation is still surfaced by `response.cancelled` in the model event stream.
-3. Turn ownership is mutually exclusive:
-   - `turn_detection.mode=client_commit`
-   - `turn_detection.mode=server_vad`
-4. `session.open` / `session.update` return normalized `config`; treat this as the source of truth.
-
-### 10.4 Upgrade Checklist
-
-1. Rename all V1 events to V2 names (see 10.1).
-2. Replace flat `auto_commit` + `vad_*` fields with `turn_detection` object (see 10.2).
-3. Remove any dependency on `response.cancelled.requested`; use `response.cancelled` / `response.done` as terminal signals.
-4. Ensure client chooses exactly one turn mode (`client_commit` or `server_vad`) and does not mix dual-side turn segmentation.
+The end of each turn emits a `gen-step summary` line with overall `step_p50/step_p95` and stage-level p50 values.

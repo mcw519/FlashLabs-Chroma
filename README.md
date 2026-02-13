@@ -185,7 +185,7 @@ inputs = {k: v.to(device) for k, v in inputs.items()}
 # 2. Generate
 output = model.generate(
     **inputs, 
-    max_new_tokens=1000, 
+    max_new_tokens=256, 
     do_sample=True,
     temperature=0.7,
     top_p=0.9,
@@ -203,7 +203,8 @@ Audio(audio_values[0].cpu().detach().numpy(), rate=24_000)
 ### Realtime WebRTC Demo (FastRTC + Gradio)
 
 This demo streams audio via WebRTC using FastRTC with Silero-VAD turn-taking and a Gradio UI.
-Audio replies are emitted incrementally as the model generates; `--output-chunk-sec` controls chunk cadence.
+By default (`--decode-mode full_turn`), audio is decoded once per turn for higher stability.
+Use `--decode-mode overlap_stream` for incremental decode; `--output-chunk-sec` then controls chunk cadence.
 
 Handler I/O schema (send-receive audio mode):
 ```python
@@ -222,6 +223,7 @@ uv sync
 # Launch the WebRTC UI
 python scripts/run_realtime_webrtc.py \
   --use-half-precision \
+  --decode-mode full_turn \
   --prompt-speaker scarlett_johansson \
   --bot-config example/bot_configs/support_agent.toml
 ```
@@ -252,6 +254,7 @@ Run the server:
 ```bash
 python scripts/run_voicebot_ws.py \
   --use-half-precision \
+  --decode-mode full_turn \
   --bot-config example/bot_configs/support_agent.toml \
   --prompt-speaker scarlett_johansson \
   --session-log-root ./logs \
@@ -277,6 +280,10 @@ python scripts/run_voicebot_ws.py \
   --server-asr-device auto
 ```
 
+Decode modes:
+- `full_turn` (default): decode once after the full turn is generated (best stability).
+- `overlap_stream`: incremental decode with overlap window (`--overlap-frames`, default `2`) to reduce boundary artifacts while keeping streaming output.
+
 Minimal client event flow:
 ```json
 {"type":"session.open","session_id":"demo-1","config":{"include_transcript_in_query":false}}
@@ -291,7 +298,8 @@ Per-session persona override:
 {"type":"session.update","session_id":"demo-2","config":{"system_prompt":null}}
 ```
 
-`include_transcript_in_query` defaults to `false` (current behavior): transcript is stored in memory only.
+`include_transcript_in_query` defaults to `false`: transcript is not injected into the current turn query.
+Instead, transcript is appended to short-term memory after current-turn inputs are prepared, so it is available from later turns.
 Set it to `true` to include transcript in the same turn's user query (`text + audio`).
 When `--server-asr-model` is enabled on server, `input.turn.commit.transcript` from client is ignored.
 

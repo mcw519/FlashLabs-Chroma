@@ -27,7 +27,31 @@ class _FakeModel:
         )
 
 
-def test_streamer_chunking_and_flush() -> None:
+def test_streamer_overlap_chunking_and_flush() -> None:
+    model = _FakeModel()
+    cancel_event = threading.Event()
+    chunks: list[np.ndarray] = []
+
+    streamer = _EngineAudioStreamer(
+        model=model,
+        frames_per_chunk=2,
+        cancel_event=cancel_event,
+        on_audio_chunk=lambda chunk: chunks.append(chunk),
+        decode_mode="overlap_stream",
+        overlap_frames=1,
+    )
+
+    streamer.put(torch.tensor([1, 2, 3]))
+    streamer.put(torch.tensor([1, 2, 3]))
+    streamer.put(torch.tensor([1, 2, 3]))
+    streamer.end()
+
+    assert len(chunks) == 2
+    assert chunks[0].shape[-1] == 20
+    assert chunks[1].shape[-1] == 10
+
+
+def test_streamer_full_turn_decode_once_by_default() -> None:
     model = _FakeModel()
     cancel_event = threading.Event()
     chunks: list[np.ndarray] = []
@@ -44,9 +68,8 @@ def test_streamer_chunking_and_flush() -> None:
     streamer.put(torch.tensor([1, 2, 3]))
     streamer.end()
 
-    assert len(chunks) == 2
-    assert chunks[0].shape[-1] == 20
-    assert chunks[1].shape[-1] == 10
+    assert len(chunks) == 1
+    assert chunks[0].shape[-1] == 30
 
 
 def test_streamer_cancel_raises() -> None:

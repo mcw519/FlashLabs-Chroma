@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import time
 
 import torch
 from typing import List, Tuple, Optional, Dict, Union, TYPE_CHECKING
@@ -32,6 +34,22 @@ if TYPE_CHECKING:
     from transformers.generation.streamers import BaseStreamer
 
 logger = logging.get_logger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _percentile(values: List[float], q: float) -> float:
+    if not values:
+        return -1.0
+    sorted_values = sorted(values)
+    pos = int(round((q / 100.0) * (len(sorted_values) - 1)))
+    pos = max(0, min(pos, len(sorted_values) - 1))
+    return float(sorted_values[pos])
 
 
 def multinomial_sample_one_no_sync(probs):
@@ -213,12 +231,39 @@ class ChromaGenerationMixin(GenerationMixin):
         if compile_forward:
             model_forward = self.get_compiled_call(generation_config.compile_config)
 
+        profile_step = _env_flag("CHROMA_GEN_STEP_PROFILE", default=False)
+        profile_interval = int(os.getenv("CHROMA_GEN_STEP_PROFILE_INTERVAL", "10"))
+        profile_interval = max(1, profile_interval)
+        profile_cuda_sync = _env_flag("CHROMA_GEN_STEP_PROFILE_CUDA_SYNC", default=True)
+        should_sync_cuda = profile_step and profile_cuda_sync and input_ids.is_cuda
+        step_idx = 0
+        step_ms_hist: List[float] = []
+        forward_ms_hist: List[float] = []
+        sample_ms_hist: List[float] = []
+        decoder_ms_hist: List[float] = []
+        put_ms_hist: List[float] = []
+
+        def _sync_cuda() -> None:
+            if should_sync_cuda:
+                torch.cuda.synchronize(device=input_ids.device)
+
+        if profile_step:
+            logger.info(
+                "generation step profiler enabled interval=%s cuda_sync=%s device=%s",
+                profile_interval,
+                should_sync_cuda,
+                input_ids.device,
+            )
+
         is_prefill = True
         while self._has_unfinished_sequences(
             this_peer_finished,
             synced_gpus,
             device=input_ids.device,
         ):
+            step_idx += 1
+            _sync_cuda()
+            step_started_at = time.perf_counter()
             # 调用ChromaForConditionalGeneration的prepare_inputs_for_generation方法，组装输入用于forward
             # 处理thinker以及prompt_audio  prompt_text
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
@@ -230,11 +275,15 @@ class ChromaGenerationMixin(GenerationMixin):
             # ============================================
 
             # 调用ChromaForConditionalGeneration的forward方法
+            _sync_cuda()
+            forward_started_at = time.perf_counter()
             if is_prefill:
                 backbone_outputs = self(**model_inputs, return_dict=True)
                 is_prefill = False
             else:
                 backbone_outputs = model_forward(**model_inputs, return_dict=True)
+            _sync_cuda()
+            forward_ms = (time.perf_counter() - forward_started_at) * 1000.0
 
             # 获取backbone的hidden_states
             next_token_logits = backbone_outputs.logits[:, -1, :].clone().float()
@@ -265,13 +314,19 @@ class ChromaGenerationMixin(GenerationMixin):
                     decoder_hidden_states += (backbone_outputs.hidden_states,)
 
             # Do sample
+            _sync_cuda()
+            sample_started_at = time.perf_counter()
             if do_sample:
                 next_tokens = sample_topk(next_token_logits, top_k, temperature)
             else:
                 next_tokens = torch.argmax(next_token_logits, dim=-1)
                 next_tokens = next_tokens.unsqueeze(1)  # [B, 1]
+            _sync_cuda()
+            sample_ms = (time.perf_counter() - sample_started_at) * 1000.0
 
             # decoder generate
+            _sync_cuda()
+            decoder_started_at = time.perf_counter()
             frame_codes = self.decoder.generate(
                 input_ids=next_tokens,
                 backbone_last_hidden_state=backbone_last_hidden_state.clone(),
@@ -282,6 +337,8 @@ class ChromaGenerationMixin(GenerationMixin):
                 temperature=temperature,
                 top_k=top_k,
             )
+            _sync_cuda()
+            decoder_ms = (time.perf_counter() - decoder_started_at) * 1000.0
 
             # 确保形状正确
             if frame_codes.shape[-1] != self.config.decoder_config.audio_num_codebooks:
@@ -307,8 +364,12 @@ class ChromaGenerationMixin(GenerationMixin):
 
             # ============================================
 
+            _sync_cuda()
+            put_started_at = time.perf_counter()
             if streamer is not None:
                 streamer.put(next_tokens.cpu())
+            _sync_cuda()
+            put_ms = (time.perf_counter() - put_started_at) * 1000.0
 
             # *************** Chroma specific ***************
             # for the eos stopping criteria, is it expected that the eos token is the same for each codebook !!!!
@@ -318,11 +379,45 @@ class ChromaGenerationMixin(GenerationMixin):
             unfinished_sequences = unfinished_sequences & ~stopping_criteria(torch.cat(generated_frames, dim=1), scores)
             this_peer_finished = unfinished_sequences.max() == 0
             cur_len += 1
+            _sync_cuda()
+            step_ms = (time.perf_counter() - step_started_at) * 1000.0
+
+            if profile_step:
+                step_ms_hist.append(step_ms)
+                forward_ms_hist.append(forward_ms)
+                sample_ms_hist.append(sample_ms)
+                decoder_ms_hist.append(decoder_ms)
+                put_ms_hist.append(put_ms)
+                if step_idx % profile_interval == 0:
+                    logger.info(
+                        "gen-step step=%s step_ms=%.2f forward_ms=%.2f sample_ms=%.2f decoder_ms=%.2f put_ms=%.2f "
+                        "step_p50=%.2f step_p95=%.2f",
+                        step_idx,
+                        step_ms,
+                        forward_ms,
+                        sample_ms,
+                        decoder_ms,
+                        put_ms,
+                        _percentile(step_ms_hist, 50.0),
+                        _percentile(step_ms_hist, 95.0),
+                    )
 
             # This is needed to properly delete outputs.logits which may be very large for first iteration
             del backbone_outputs
 
             del frame_codes
+
+        if profile_step and step_ms_hist:
+            logger.info(
+                "gen-step summary steps=%s step_p50=%.2f step_p95=%.2f forward_p50=%.2f decoder_p50=%.2f sample_p50=%.2f put_p50=%.2f",
+                len(step_ms_hist),
+                _percentile(step_ms_hist, 50.0),
+                _percentile(step_ms_hist, 95.0),
+                _percentile(forward_ms_hist, 50.0),
+                _percentile(decoder_ms_hist, 50.0),
+                _percentile(sample_ms_hist, 50.0),
+                _percentile(put_ms_hist, 50.0),
+            )
 
         if streamer is not None:
             streamer.end()
